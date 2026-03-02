@@ -1,0 +1,48 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "LLM Trace Simulator - Qwen3-32B (H100)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "profiler.layers.main",
+      "console": "integratedTerminal",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "--hardware", "H100",
+        "--model", "Qwen/Qwen3-32B",
+        "--num-layers", "1",
+        "--tp-size", "1, 2",
+        "--warmup", "10",
+        "--repeat", "30",
+        "--max-len", "10",
+        "--device", "cuda"
+      ],
+      "justMyCode": false
+    },
+    {
+      "name": "LLM Trace Simulator - Llama3.1 (H100)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "profiler.layers.main",
+      "console": "integratedTerminal",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "--hardware", "H100",
+        "--model", "meta-llama/Llama-3.1-8B",
+        "--num-layers", "1",
+        "--tp-size", "1, 2",
+        "--warmup", "10",
+        "--repeat", "30",
+        "--max-len", "10",
+        "--device", "cuda"
+      ],
+      "justMyCode": false
+    }
+
+  ]
+}

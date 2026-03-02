@@ -53,6 +53,7 @@ def parse_args():
     # Which stages to run
     parser.add_argument("--legacy", action="store_true", help="Use legacy attention with no prediction (not recommended)")
 
+    return parser.parse_args()
 
 
 def _create_past_key_values(config, kv_len, device):
@@ -72,7 +73,11 @@ def _create_past_key_values(config, kv_len, device):
     num_kv_heads_total = config.num_key_value_heads // config.tp_size
 
     # Head dim is always based on total attention heads (not KV heads)
-    head_dim = config.hidden_size // (config.num_attention_heads) # config has been already divided by tp_size
+    # if config has attribute "head_dim":
+    if hasattr(config, "head_dim"):
+        head_dim = config.head_dim 
+    else:
+        head_dim = config.hidden_size // (config.num_attention_heads) # config has been already divided by tp_size
 
     # Choose dtype from config
     if getattr(config, "dtype", None) == torch.float16:
@@ -109,8 +114,14 @@ def _create_past_key_values(config, kv_len, device):
         from transformers.models.phimoe.modeling_phimoe import PhimoeRotaryEmbedding
         rope = PhimoeRotaryEmbedding(config)
         cos, sin = rope(dummy_x, kv_len)
+    elif "qwen3" in config.model_type:
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+        rope = Qwen3RotaryEmbedding(config)
+        bsz = dummy_x.shape[0]
+        position_ids = torch.arange(kv_len, device=dummy_x.device).unsqueeze(0).expand(bsz, -1)
+        cos, sin = rope(dummy_x, position_ids)
     else:
-        raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE models are supported in profiling. We will add more models soon.")
+        raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE, Qwen3 models are supported in profiling. We will add more models soon.")
 
     cache = DynamicCache()
     for layer_idx in range(num_layers):
@@ -130,7 +141,7 @@ def run_profile(
     hardware="A6000",
     model_name="meta-llama/Llama-3.1-8B",
     num_layers=None,
-    input_lengths=[128, 256, 512, 1024],
+    input_lengths=[128, 256, 512, 1024, 2048],
     is_prefill=True,
     tp_size=1,
     device="cuda",
@@ -163,8 +174,13 @@ def run_profile(
         # If you want to collect router stats during profiling, turn this on
         config.collect_router_stats = False
         model = PhimoeForCausalLM(config)
+    elif 'qwen3' in config.model_type:
+        from models.qwen3 import Qwen3ForCausalLM
+        # If you want to collect router stats during profiling, turn this on
+        config.collect_router_stats = False
+        model = Qwen3ForCausalLM(config)
     else:
-        raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE models are supported in profiling. We will add more models soon.")
+        raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE, Qwen3 models are supported in profiling. We will add more models soon.")
     
     model.eval()
     model.to(config.dtype)
@@ -210,7 +226,7 @@ def run_profile(
                 for _ in range(repeat):
                     past_key_values = _create_past_key_values(config, kv_len, device)
                     with torch.no_grad():
-                        _ = model(input_ids, past_key_values=past_key_values, use_cache=True)
+                        _ = model(input_ids, past_key_values=past_key_values, use_cache=True) # 실제로 실행하는 부분 qwen.py 에 record_function이 걸려있음
                 
             torch.cuda.synchronize()
             time_stats = record_function_tracer.get_operation_time_stats()
@@ -227,7 +243,7 @@ def run_profile(
             time_stats = timer_stats_store.get_stats()
 
 
-        profile_keys = ["embedding", "input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate_proj", "up_proj", "act_fn", "down_proj", "final_layernorm", "lm_head"]
+        profile_keys = ["embedding", "embed_tokens", "input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "post_attention_layernorm", "gate_proj", "up_proj", "act_fn", "down_proj", "final_layernorm", "lm_head"]
         if 'mixtral' in config.model_type or 'phimoe' in config.model_type:
             profile_keys += ["gate", "expert.w1", "expert.w2", "expert.w3"]
 
@@ -253,7 +269,9 @@ def run_profile(
         if 'llama' in config.model_type:
             block_components = ["input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate_proj", "up_proj", "act_fn", "down_proj"]
         elif 'mixtral' in config.model_type or 'phimoe' in config.model_type:
-            block_components = ["input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate"]       
+            block_components = ["input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate"]
+        elif 'qwen3' in config.model_type:
+            block_components = ["input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate_proj", "up_proj", "act_fn", "down_proj"]    
         else:
             raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE models are supported in profiling. We will add more models soon.")
         
@@ -292,7 +310,7 @@ def main():
     tp_sizes = [int(x.strip()) for x in args.tp_size.split(",")]
 
     # Load model config once per script run
-    model_config = AutoConfig.from_pretrained(args.model)
+    model_config = AutoConfig.from_pretrained(args.model) # token="hf_xxx"
 
     for tp_size in tp_sizes:
         if validate_tp_size(tp_size, model_config.num_attention_heads):
