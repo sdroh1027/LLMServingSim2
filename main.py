@@ -117,7 +117,8 @@ def main():
     # If you want to set more specific information such as latency, look at config.py and each json file
     if network_backend == 'analytical':
         network=os.path.join(astra_sim, "inputs/network/network.yml")
-        binary=os.path.join(astra_sim, "build/astra_analytical/build/AnalyticalAstra/bin/AnalyticalAstra")
+        _binary_base = os.path.join(astra_sim, "build/astra_analytical/build/AnalyticalAstra/bin/AnalyticalAstra")
+        binary = _binary_base + ".exe" if os.path.exists(_binary_base + ".exe") else _binary_base
     elif network_backend == 'ns3':
         network=os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/config/config.txt")
         binary=os.path.join(astra_sim, "extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default")
