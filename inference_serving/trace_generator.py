@@ -136,7 +136,7 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
     kv_head = config.get('num_key_value_heads', n_head)
-    head_dim = n_embd // n_head
+    head_dim = config.get('head_dim', n_embd // n_head)
     npus_per_group = npu_num // npu_group
 
     if not enable_attn_prediction:
@@ -545,7 +545,7 @@ def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, p
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
     kv_head = config.get('num_key_value_heads', n_head)
-    head_dim = n_embd // n_head
+    head_dim = config.get('head_dim', n_embd // n_head)
     npus_per_group = npu_num // npu_group
 
     # Use cached performance DB instead of reading CSV every time
@@ -2129,7 +2129,7 @@ def _get_perf_row(perf_db, hardware, layer_name, input_len, kv_cache_len, tp_siz
     try:
         return perf_db[key]
     except KeyError:
-        if hardware.lower().startswith("tpu"):
+        if True:  # nearest-match fallback for all hardware (covers incomplete perf DBs)
             target_layer = str(layer_name)
             target_tp = int(tp_size)
             target_kv = int(kv_cache_len)
@@ -2156,8 +2156,10 @@ def _get_perf_row(perf_db, hardware, layer_name, input_len, kv_cache_len, tp_siz
                     best_kv_match = kv_match
 
             if best_row is not None:
+                logger.warning(f"[PerfDB] Nearest-match fallback: key={key} (diff={best_diff})")
                 return best_row
             else:
+                logger.warning(f"[PerfDB] No match found for key={key}, returning dummy latency=1ns")
                 return {"layer_name": layer_name, "input": input_len, "kv_cache": kv_cache_len, "tp_size": tp_size, "latency(ns)": 1}
         else: 
             raise KeyError(
@@ -2300,7 +2302,7 @@ def _build_attn_feature_row(
     n_embd = config["hidden_size"]
     n_head = config["num_attention_heads"]
     kv_head = config.get("num_key_value_heads", n_head)
-    head_dim = n_embd // n_head
+    head_dim = config.get('head_dim', n_embd // n_head)
 
     tensor_parallel_degree = npus_per_group
     num_heads_per_shard = n_head // tensor_parallel_degree

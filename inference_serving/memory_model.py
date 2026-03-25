@@ -34,10 +34,10 @@ class MemoryModel():
         self.n_embd = self.config['hidden_size']
         self.n_layer = self.config['num_hidden_layers']
         self.n_head = self.config['num_attention_heads']
-        self.head_dim = self.n_embd // self.n_head
+        self.head_dim = self.config.get('head_dim', self.n_embd // self.n_head)
         self.kv_head = self.config.get("num_key_value_heads", self.n_head)  # fallback to n_head if not defined
         self.group = self.n_head // self.kv_head  # group size
-        self.kv_dim = self.n_embd // self.group   # equivalent to: kv_head * (n_embd // n_head)
+        self.kv_dim = self.kv_head * self.head_dim   # = kv_head * head_dim
         self.vocab_size = self.config['vocab_size']
         self.is_moe = True if 'num_local_experts' in self.config else False
 
@@ -545,11 +545,11 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, tp=1, fp=
     config = get_config(model)
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
-    head_dim = n_embd // n_head
+    head_dim = config.get('head_dim', n_embd // n_head)
     vocab_size = config['vocab_size']
     kv_head = config.get("num_key_value_heads", n_head)  # fallback to n_head if not defined
     group = n_head // kv_head  # group size for GQA
-    kv_dim = n_embd // group   # = kv_head * head_dim
+    kv_dim = kv_head * head_dim   # = kv_head * head_dim
     ffn_dim = config.get("intermediate_size", config.get("ffn_dim"))  # ffn_dim or intermediate_size
     num_local_experts = config.get("num_local_experts", 1)
 
