@@ -92,7 +92,10 @@ def profile_flash_attention(
 
     num_heads_per_shard = getattr(model_config, "num_attention_heads", 32) // tp_size
     num_kv_heads_per_shard = getattr(model_config, "num_key_value_heads", getattr(model_config, "num_attention_heads", 32)) // tp_size
-    head_dim = getattr(model_config, "hidden_size", 4096) // getattr(model_config, "num_attention_heads", 32)
+    if hasattr(model_config, "head_dim"):
+        head_dim = model_config.head_dim
+    else:
+        head_dim = getattr(model_config, "hidden_size", 4096) // getattr(model_config, "num_attention_heads", 32)
 
     # -------------------------------------------------------
     # Build varlen Q/K/V inputs

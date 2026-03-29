@@ -243,7 +243,7 @@ def run_profile(
             time_stats = timer_stats_store.get_stats()
 
 
-        profile_keys = ["embedding", "embed_tokens", "input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "post_attention_layernorm", "gate_proj", "up_proj", "act_fn", "down_proj", "final_layernorm", "lm_head"]
+        profile_keys = ["embedding", "input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate_proj", "up_proj", "act_fn", "down_proj", "final_layernorm", "lm_head"]
         if 'mixtral' in config.model_type or 'phimoe' in config.model_type:
             profile_keys += ["gate", "expert.w1", "expert.w2", "expert.w3"]
 
