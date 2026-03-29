@@ -1,0 +1,7 @@
+{
+  "tokenizer_model": "gpt2",
+  "source_dataset": "../LVEval/data/hotpotwikiqa_mixup/hotpotwikiqa_mixup_16k.jsonl",
+  "num_req": 100,
+  "arrival_rate_req_per_sec": 1.0,
+  "seed": 42
+}

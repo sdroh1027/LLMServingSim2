@@ -8,3 +8,11 @@ __pycache__/
 
 # Ignore pkl files
 *.pkl
+
+output/
+
+# Ignore large LVEval trace dataset files (use meta.json instead)
+dataset/lveval_*.jsonl
+
+# Ignore simulation output CSV files
+output_*.csv
