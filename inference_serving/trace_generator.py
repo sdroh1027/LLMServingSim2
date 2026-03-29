@@ -66,6 +66,18 @@ def generate_trace(batch, hardware, npu_num, npu_group, pd_type=None, node_id=0,
     if power_model is not None:
         power_model.reset_log()
 
+    # guard: empty batch is a scheduler-level anomaly
+    if batch.total_len == 0 and len(batch.requests) == 0:
+        logger.error(
+            "Batch #%d has total_len=0 and no requests — skipping trace generation. "
+            "This indicates an empty batch was dispatched (possible scheduler bug).",
+            batch.batch_id,
+            extra={"node_id": node_id, "instance_id": instance_id},
+        )
+        with open(output_path, 'w') as f:
+            pass
+        return
+
     # make trace
     if not enable_sub_batch_interleaving:
         _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batch, max_len, output_path,
@@ -2129,50 +2141,90 @@ def _get_perf_row(perf_db, hardware, layer_name, input_len, kv_cache_len, tp_siz
     try:
         return perf_db[key]
     except KeyError:
-        if True:  # nearest-match fallback for all hardware (covers incomplete perf DBs)
-            target_layer = str(layer_name)
-            target_tp = int(tp_size)
-            target_kv = int(kv_cache_len)
-            target_input = int(input_len)
+        target_layer = str(layer_name)
+        target_tp = int(tp_size)
+        target_kv = int(kv_cache_len)
+        target_input = int(input_len)
 
-            best_row = None
-            best_diff = None
-            best_kv_match = False
+        best_row = None
+        best_diff = None
+        best_kv_match = False
 
-            for (layer, inp, kv, tp), row in perf_db.items():
-                if layer != target_layer or tp != target_tp:
-                    continue
+        for (layer, inp, kv, tp), row in perf_db.items():
+            if layer != target_layer or tp != target_tp:
+                continue
 
-                kv_match = kv == target_kv
-                diff = abs(inp - target_input)
+            kv_match = kv == target_kv
+            diff = abs(inp - target_input)
 
-                if (
-                    best_row is None
-                    or (kv_match and not best_kv_match)
-                    or (kv_match == best_kv_match and diff < best_diff)
-                ):
-                    best_row = row
-                    best_diff = diff
-                    best_kv_match = kv_match
+            if (
+                best_row is None
+                or (kv_match and not best_kv_match)
+                or (kv_match == best_kv_match and diff < best_diff)
+            ):
+                best_row = row
+                best_diff = diff
+                best_kv_match = kv_match
 
-            if best_row is not None:
+        if best_row is not None:
+            base_input = best_row['input']
+            if best_diff > 0 and base_input > 0:
+                # Linear extrapolation: GEMM latency scales proportionally with token count
+                scale = target_input / base_input
+                scaled_row = dict(best_row)
+                scaled_row['latency(ns)'] = max(1, int(best_row['latency(ns)'] * scale))
+                logger.warning(
+                    f"[PerfDB] Linear extrapolation: key={key}, base_input={base_input}, scale={scale:.2f}"
+                )
+                return scaled_row
+            else:
                 logger.warning(f"[PerfDB] Nearest-match fallback: key={key} (diff={best_diff})")
                 return best_row
-            else:
-                logger.warning(f"[PerfDB] No match found for key={key}, returning dummy latency=1ns")
-                return {"layer_name": layer_name, "input": input_len, "kv_cache": kv_cache_len, "tp_size": tp_size, "latency(ns)": 1}
-        else: 
-            raise KeyError(
-                f"No perf entry for key={key} in performance DB."
-            )
+        else:
+            logger.warning(f"[PerfDB] No match found for key={key}, returning dummy latency=1ns")
+            return {"layer_name": layer_name, "input": input_len, "kv_cache": kv_cache_len, "tp_size": tp_size, "latency(ns)": 1}
     
 def _get_attn_perf_row(perf_db, key):
     try:
         return perf_db[key]
     except KeyError:
-        raise KeyError(
-            f"No perf entry for key={key} in attention performance DB."
-        )
+        # Nearest-match + linear extrapolation on the second dimension.
+        # key = (dim0, dim1): prefill=(kv_cache, chunk_size), decode=(batch_size, kv_cache)
+        # Prefer exact dim0 match; scale latency linearly on the mismatched dim1.
+        target_d0, target_d1 = key
+
+        best_row = None
+        best_d0_diff = None
+        best_d1_diff = None
+
+        for (d0, d1), row in perf_db.items():
+            d0_diff = abs(d0 - target_d0)
+            d1_diff = abs(d1 - target_d1)
+            if (
+                best_row is None
+                or d0_diff < best_d0_diff
+                or (d0_diff == best_d0_diff and d1_diff < best_d1_diff)
+            ):
+                best_row = row
+                best_d0_diff = d0_diff
+                best_d1_diff = d1_diff
+                best_key = (d0, d1)
+
+        if best_row is None:
+            raise KeyError(f"No perf entry for key={key} in attention performance DB.")
+
+        base_d1 = best_key[1]
+        if best_d1_diff > 0 and base_d1 > 0:
+            scale = target_d1 / base_d1
+            scaled_row = dict(best_row)
+            scaled_row['latency(ns)'] = max(1, int(best_row['latency(ns)'] * scale))
+            logger.warning(
+                f"[AttnPerfDB] Linear extrapolation: key={key}, base={best_key}, scale={scale:.2f}"
+            )
+            return scaled_row
+        else:
+            logger.warning(f"[AttnPerfDB] Nearest-match fallback: key={key}, base={best_key}")
+            return best_row
 
 def _make_attn_db_key(hardware, model, batch):
     _kv_cache_prediction_granularity = 64
