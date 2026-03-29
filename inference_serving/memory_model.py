@@ -85,7 +85,8 @@ class MemoryModel():
                                                     )
                 
         # Hash id -> token length for corresponding prefix cache block
-        self._npu_cache_hashtolen = {}
+        self._npu_cache_hashtolen = {}   # hash -> tlen
+        self._npu_cache_hashref   = {}   # hash -> ref_count (shared-page dedup)
         self._cpu_cache_hashtolen = {}
         self._bytes_per_token = self.get_kv(1)  # bytes per token for kv cache
     # get weight of the model 
@@ -326,11 +327,13 @@ class MemoryModel():
     def avail_size(self, device):
         if not self.enable_prefix_caching:
             return 0
-        
+
         if device == Device.NPU:
-            return self.npu_prefix_cache.avail_size() * self._bytes_per_token
+            # RadixCache.avail_size() = capacity_bytes - total_memory_usage_bytes (already bytes)
+            # evictable_size_() is token count, so needs * _bytes_per_token — but avail_size does not
+            return self.npu_prefix_cache.avail_size()
         elif device == Device.CPU or device == Device.CXL:
-            return self.second_tier_prefix_cache.avail_size() * self._bytes_per_token
+            return self.second_tier_prefix_cache.avail_size()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to get available size of prefix cache in unsupported device {device}")
     
@@ -499,21 +502,32 @@ class MemoryModel():
         cpu_byte_free = 0
         for ev in self.npu_prefix_cache.take_events():
             if isinstance(ev, BlockStored):
+                # Each BlockStored = one physical page stored; always alloc.
+                # _npu_cache_hashref tracks reference count to prevent double-free
+                # when the same chained hash appears in multiple BlockRemoved events.
                 tlen = len(ev.token_ids)
                 for h in ev.block_hashes:
+                    self._npu_cache_hashref[h] = self._npu_cache_hashref.get(h, 0) + 1
                     self._npu_cache_hashtolen[h] = tlen
-                npu_byte_alloc += self.get_kv(tlen)
+                    npu_byte_alloc += self.get_kv(tlen)
             elif isinstance(ev, BlockRemoved):
                 for h in ev.block_hashes:
-                    tlen = self._npu_cache_hashtolen.pop(h, 0)
-                    if tlen == 0:
-                        self.logger.warning("NPU prefix cache remove unknown block hash {h}")
-                    npu_byte_free += self.get_kv(tlen)
+                    ref = self._npu_cache_hashref.get(h, 0)
+                    if ref == 0:
+                        self.logger.warning("BlockRemoved unknown hash %s", h)
+                    else:
+                        tlen = self._npu_cache_hashtolen[h]
+                        npu_byte_free += self.get_kv(tlen)
+                        if ref == 1:
+                            del self._npu_cache_hashtolen[h]
+                            del self._npu_cache_hashref[h]
+                        else:
+                            self._npu_cache_hashref[h] -= 1
         
-        if npu_byte_alloc > 0:
-            self.allocate(npu_byte_alloc, Device.NPU)
         if npu_byte_free > 0:
             self.free(npu_byte_free, Device.NPU)
+        if npu_byte_alloc > 0:
+            self.allocate(npu_byte_alloc, Device.NPU)
 
         if not self.enable_prefix_sharing and self.prefix_storage is Device.CPU:
             for ev in self.second_tier_prefix_cache.take_events():

@@ -87,7 +87,7 @@ class TreeNode:
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         # store hash values of each pages
-        self.hash_value: Optional[List[str]] = None
+        self.hash_value: Optional[List[int]] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -96,9 +96,9 @@ class TreeNode:
     def evicted(self):
         return self.value is None
     
-    def get_last_hash_value(self) -> Optional[str]:
-        """Returns the hash value of the last page in this node."""
-        if self.hash_value is None or len(self.hash_value) == 0:
+    def get_last_hash_value(self) -> Optional[int]:
+        """Returns the chained hash of the last page in this node."""
+        if not self.hash_value:
             return None
         return self.hash_value[-1]
 
@@ -427,7 +427,14 @@ class RadixCache():
 
         child.parent = new_node
         child.key = child.key[split_len:]
-        
+
+        # split_len is always a multiple of page_size (guaranteed by _key_match_paged),
+        # so hash_value partitions cleanly by page count.
+        if child.hash_value is not None:
+            n_pages = split_len // self.page_size
+            new_node.hash_value = child.hash_value[:n_pages]
+            child.hash_value = child.hash_value[n_pages:]
+
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         return new_node
@@ -518,23 +525,20 @@ class RadixCache():
 
     def _record_store_event(self, node: TreeNode):
         # One BlockStored per ``page_size`` chunk.
+        # Chained hashing: block_hash = hash(page_tokens + (parent_hash,))
+        # Identical token content at different prefix positions → different hashes.
         if self.enable_kv_cache_events:
-            # First chunk links to the last page of the parent node (if any).
-            if node.parent is None or node != self.root_node:
-                parent_block_hash = None
-            else:
-                last_page_start = (
-                    (len(node.parent.key) - 1) // self.page_size
-                ) * self.page_size
-                parent_parent_tokens = node.parent.key[last_page_start:]
-                parent_block_hash = hash(tuple(parent_parent_tokens))
+            # Seed from parent node's last page hash.
+            # root_node.hash_value is None, so get_last_hash_value() returns None
+            # for direct children of root — no special case needed.
+            parent_block_hash = node.parent.get_last_hash_value()
 
+            node.hash_value = []
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key[start : start + self.page_size]
-                if not page_tokens:
-                    continue
+                block_hash = hash(tuple(page_tokens) + (parent_block_hash,))
+                node.hash_value.append(block_hash)
 
-                block_hash = hash(tuple(page_tokens))
                 self.kv_event_queue.append(
                     BlockStored(
                         block_hashes=[block_hash],
@@ -545,18 +549,20 @@ class RadixCache():
                     )
                 )
 
-                # Chain next chunk to this one.
                 parent_block_hash = block_hash
 
     def _record_remove_event(self, node: TreeNode):
-        # One BlockRemoved per chunk.
+        # Use stored chained hashes (node.hash_value) so they match what was
+        # emitted in _record_store_event — not a raw content rehash.
         if self.enable_kv_cache_events:
-            for start in range(0, len(node.key), self.page_size):
-                page_tokens = node.key[start : start + self.page_size]
-                if not page_tokens:
-                    continue
-                block_hash = hash(tuple(page_tokens))
-                self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+            if node.hash_value:
+                self.kv_event_queue.append(BlockRemoved(block_hashes=node.hash_value))
+            else:
+                # Should not happen if _split_node propagates hash_value correctly.
+                self.logger.warning(
+                    "BlockRemoved: node has no hash_value (key len=%d), eviction event skipped",
+                    len(node.key),
+                )
 
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
