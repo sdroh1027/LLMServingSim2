@@ -358,6 +358,14 @@ class Scheduler:
 
             # recompute kv_size
             kv_size = self.memory.get_block_kv(batch_req, batch_len) # includes evicted input, and initiation input
+            MB = 1024 * 1024
+            _avail_radix = self.memory.npu_prefix_cache.avail_size() / MB
+            _avail_npu   = (self.memory.npu_mem - self.memory.npu_used) / MB
+            _kv_mb       = kv_size / MB
+            self.logger.debug(
+                "[MEM] radix_avail=%.1fMB  npu_avail=%.1fMB  kv_need=%.1fMB  diff=%.1fMB",
+                _avail_radix, _avail_npu, _kv_mb, _avail_radix - _avail_npu,
+            )
             evict_size = (kv_size - self.memory.avail_size(Device.NPU)) if kv_size > self.memory.avail_size(Device.NPU) else 0
 
             if evict_size > 0:
@@ -693,10 +701,11 @@ class Scheduler:
             
             # Write the column headers
             if not is_append:
-                writer.writerow(['instance id', 'request id', 'model', 'input', 'output', 
-                                'arrival', 'end_time', 'latency', 
-                                'queuing_delay', 'TTFT', 'TPOT', 'ITL'])
-            
+                writer.writerow(['instance id', 'request id', 'model', 'input', 'output',
+                                'arrival', 'end_time', 'latency',
+                                'queuing_delay', 'TTFT', 'TPOT', 'ITL',
+                                'npu_cache_hit', 'storage_cache_hit', 'prefix_cache_hit'])
+
             # Write each request's information
             for req in self.done:
                 writer.writerow([
@@ -711,5 +720,8 @@ class Scheduler:
                     req.queuing_delay,
                     req.ttft,
                     req.tpot,
-                    req.itl
+                    req.itl,
+                    getattr(req, 'npu_cache_hit', 0),
+                    getattr(req, 'storage_cache_hit', 0),
+                    getattr(req, 'prefix_cache_hit', 0),
                 ])
