@@ -2,10 +2,10 @@
     "num_nodes": 1,
     "link_bw": 112,
     "link_latency": 0,
-    "nodes": [   
+    "nodes": [
         {
             "num_instances": 1,
-            "cpu_mem": 
+            "cpu_mem":
                 {
                     "mem_size": 128,
                     "mem_bw": 256,
@@ -17,7 +17,7 @@
                     "hardware": "A6000",
                     "npu_mem":
                         {
-                            "mem_size": 48,
+                            "mem_size": 1024,
                             "mem_bw": 768,
                             "mem_latency": 0
                         },
