@@ -203,7 +203,7 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
         extra={"node_id": node_id, "instance_id": instance_id},
     )
 
-    with open(output_path, 'w') as f:
+    with open(output_path, 'w') as f: # TODO: 특정 모델의 경우 수정해야 할 수 도 있음
         # embedding layer
         embedding_matching_row = _get_perf_row(perf_db, hardware, "embedding", total_len, 0, npus_per_group)
         emb_input, emb_weight, emb_output = calculate_sizes(model, embedding_matching_row["layer_name"], total_len, fp=fp)
@@ -2173,15 +2173,15 @@ def _get_perf_row(perf_db, hardware, layer_name, input_len, kv_cache_len, tp_siz
                 scale = target_input / base_input
                 scaled_row = dict(best_row)
                 scaled_row['latency(ns)'] = max(1, int(best_row['latency(ns)'] * scale))
-                logger.warning(
-                    f"[PerfDB] Linear extrapolation: key={key}, base_input={base_input}, scale={scale:.2f}"
-                )
+                logger.debug(
+                    f"[PerfDB] Linear extrapolation: layer={target_layer}, input_len={target_input}, tp_size={target_tp} | base_input={base_input}, scale={scale:.2f}"
+                ) # kv_cache_len is always 0(deprecated) so not printed  # input len is maybe batchsize in decode phase
                 return scaled_row
             else:
-                logger.warning(f"[PerfDB] Nearest-match fallback: key={key} (diff={best_diff})")
+                logger.warning(f"[PerfDB] Nearest-match fallback: layer={target_layer}, input_len={target_input}, kv_cache_len={target_kv}, tp_size={target_tp} (diff={best_diff})")
                 return best_row
         else:
-            logger.warning(f"[PerfDB] No match found for key={key}, returning dummy latency=1ns")
+            logger.warning(f"[PerfDB] No match found: layer={target_layer}, input_len={target_input}, kv_cache_len={target_kv}, tp_size={target_tp}, returning dummy latency=1ns")
             return {"layer_name": layer_name, "input": input_len, "kv_cache": kv_cache_len, "tp_size": tp_size, "latency(ns)": 1}
     
 def _get_attn_perf_row(perf_db, key):
@@ -2219,11 +2219,11 @@ def _get_attn_perf_row(perf_db, key):
             scaled_row = dict(best_row)
             scaled_row['latency(ns)'] = max(1, int(best_row['latency(ns)'] * scale))
             logger.warning(
-                f"[AttnPerfDB] Linear extrapolation: key={key}, base={best_key}, scale={scale:.2f}"
+                f"[AttnPerfDB] Linear extrapolation: dim0={target_d0}, dim1={target_d1} | base=({best_key[0]},{best_key[1]}), scale={scale:.2f}"
             )
             return scaled_row
         else:
-            logger.warning(f"[AttnPerfDB] Nearest-match fallback: key={key}, base={best_key}")
+            logger.warning(f"[AttnPerfDB] Nearest-match fallback: dim0={target_d0}, dim1={target_d1} | base=({best_key[0]},{best_key[1]})")
             return best_row
 
 def _make_attn_db_key(hardware, model, batch):
