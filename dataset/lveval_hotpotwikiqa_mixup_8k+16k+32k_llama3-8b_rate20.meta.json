@@ -1,5 +1,5 @@
 {
-  "tokenizer_model": "gpt2",
+  "tokenizer_model": "meta-llama/Llama-3.1-8B",
   "source_32k": "../LVEval/data/hotpotwikiqa_mixup/hotpotwikiqa_mixup_32k.jsonl",
   "num_conv": 100,
   "total_req": 300,
