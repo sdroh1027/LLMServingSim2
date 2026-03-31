@@ -56,6 +56,8 @@ def main():
     parser.add_argument('--log-interval', type=float, help='interval to log throughput (sec)', default=0.5)
     parser.add_argument('--log-level', type=str, choices=['WARNING', 'INFO', 'DEBUG'], help='log level to use', default='WARNING')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], help='network backend to use', default='analytical')
+    parser.add_argument('--bypass-astrasim', action='store_true', help='bypass AstraSim and compute cycles directly from trace (faster, single-node only)', default=False)
+    parser.add_argument('--bypass-use-file', action='store_true', help='use file-based bypass path instead of in-memory (slower, for debugging)', default=False)
 
     args = parser.parse_args()
 
@@ -93,8 +95,25 @@ def main():
     num_req=args.num_req
     log_interval=args.log_interval
     network_backend = args.network_backend
+    bypass_astrasim = args.bypass_astrasim
+    bypass_use_file = args.bypass_use_file
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading)
+    # Read link/CXL bw/latency for bypass mode transfer calculation
+    if bypass_astrasim:
+        _cc_path = f'../{args.cluster_config}' if not os.path.isabs(args.cluster_config) else args.cluster_config
+        with open(_cc_path, 'r') as _f:
+            _cc = json.load(_f)
+        _link_bw = _cc.get("link_bw", 0)
+        _link_latency = _cc.get("link_latency", 0)
+        _cxl_cfg = _cc.get("cxl_mem", {})
+        _cxl_bw = _cxl_cfg.get("mem_bw", 0)
+        _cxl_latency = _cxl_cfg.get("mem_latency", 0)
+    else:
+        _link_bw = 0
+        _link_latency = 0
+        _cxl_bw = 0
+        _cxl_latency = 0
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
     instances = cluster["instances"]
@@ -254,20 +273,30 @@ def main():
         event_time = first_arival_time
     else:
         event_time = INTERVAL
-    generate_event(int(event_time))
-    # Make Chakra Grapth
-    generate_graph(None, None, total_npu, event=True)
-    # set first workload file
-    workload = get_workload(None, None, event=True)
-    # run subprocess
-    args = [binary, "--workload-configuration="+workload, "--system-configuration="+system, "--network-configuration="+network, "--memory-configuration="+memory]
-    if start_npu_ids != "":
-        args.append("--start-npu-ids="+start_npu_ids)
-    if end_npu_ids != "":
-        args.append("--end-npu-ids="+end_npu_ids)
-    if network_backend == 'ns3':
-        args.append("--logical-topology-configuration="+astra_sim+"/inputs/logical_topology/logical_8nodes_1D.json")
-    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+    p = None  # AstraSim subprocess (None in bypass mode)
+
+    if bypass_astrasim:
+        # Bypass mode: use BypassController instead of AstraSim
+        controller = BypassController(total_npu)
+        # Submit initial timer event (equivalent to generate_event + AstraSim startup)
+        for npu_id in range(total_npu):
+            controller.submit_event(int(event_time), npu_id)
+    else:
+        generate_event(int(event_time))
+        # Make Chakra Graph
+        generate_graph(None, None, total_npu, event=True)
+        # set first workload file
+        workload = get_workload(None, None, event=True)
+        # run subprocess
+        args = [binary, "--workload-configuration="+workload, "--system-configuration="+system, "--network-configuration="+network, "--memory-configuration="+memory]
+        if start_npu_ids != "":
+            args.append("--start-npu-ids="+start_npu_ids)
+        if end_npu_ids != "":
+            args.append("--end-npu-ids="+end_npu_ids)
+        if network_backend == 'ns3':
+            args.append("--logical-topology-configuration="+astra_sim+"/inputs/logical_topology/logical_8nodes_1D.json")
+        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
     # ----------------------------------- Start simulation loop ------------------------------------
     # Starting simulation, one while loop processes one iteration
@@ -317,14 +346,34 @@ def main():
                 # mark non-waiting state
                 waiting_request[instance_id] = False
                 instance = instances[instance_id]
-                generate_trace(new_req, instance["hardware"], instance["npu_num"], instance["npu_group"], instance["pd_type"], 
-                               node_id, instance_id, max_num_batched_tokens, placement[instance_id], block_mode_on[instance_id],
-                               expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id], enable_attn_prediction, 
-                               enable_sub_batch_interleaving, fp)
-                generate_graph(new_req, instance["hardware"], instance["npu_num"], node_id,
-                               instance_id, inst2npu_mapping[instance_id], enable_local_offloading)
-            workload = get_workload(new_req, instance["hardware"], instance_id)
-            controller.write_flush(p, workload)
+                if bypass_astrasim:
+                    if bypass_use_file:
+                        # File-based bypass path (original, slower)
+                        generate_trace(new_req, instance["hardware"], instance["npu_num"], instance["npu_group"], instance["pd_type"],
+                                       node_id, instance_id, max_num_batched_tokens, placement[instance_id], block_mode_on[instance_id],
+                                       expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id], enable_attn_prediction,
+                                       enable_sub_batch_interleaving, fp)
+                        trace_path = f"inputs/trace/{instance['hardware']}/{new_req.model}/instance{instance_id}_batch{new_req.batch_id}.txt"
+                        batch_cycles_ns = compute_trace_cycles(trace_path, _link_bw, _link_latency, _cxl_bw, _cxl_latency)
+                    else:
+                        # In-memory bypass path (default, faster — no final file rewrite/reread)
+                        layers = generate_trace_bypass(new_req, instance["hardware"], instance["npu_num"], instance["npu_group"], instance["pd_type"],
+                                       node_id, instance_id, max_num_batched_tokens, placement[instance_id], block_mode_on[instance_id],
+                                       expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id], enable_attn_prediction,
+                                       enable_sub_batch_interleaving, fp)
+                        batch_cycles_ns = compute_trace_cycles_mem(layers, _link_bw, _link_latency, _cxl_bw, _cxl_latency)
+                    finish_time = current + batch_cycles_ns
+                    controller.submit_event(finish_time, sys)
+                else:
+                    generate_trace(new_req, instance["hardware"], instance["npu_num"], instance["npu_group"], instance["pd_type"],
+                                   node_id, instance_id, max_num_batched_tokens, placement[instance_id], block_mode_on[instance_id],
+                                   expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id], enable_attn_prediction,
+                                   enable_sub_batch_interleaving, fp)
+                    generate_graph(new_req, instance["hardware"], instance["npu_num"], node_id,
+                                   instance_id, inst2npu_mapping[instance_id], enable_local_offloading)
+            if not bypass_astrasim:
+                workload = get_workload(new_req, instance["hardware"], instance_id)
+                controller.write_flush(p, workload)
 
         # check time to store throughput
         if current > last_log + INTERVAL:
@@ -458,12 +507,23 @@ def main():
 
                 print(SINGLE_BAR)
                 print(bold(cyan("▶ Exiting simulation...\n")))
-                controller.write_flush(p, "exit")
+                if not bypass_astrasim:
+                    controller.write_flush(p, "exit")
                 break
 
-            controller.write_flush(p, "done") # make done instances to sleep
+            if not bypass_astrasim:
+                controller.write_flush(p, "done") # make done instances to sleep
         elif new_req == None:
-            controller.write_flush(p, "pass")
+            if bypass_astrasim:
+                # No batch scheduled — add a timer event to advance time
+                # to the next request arrival or log interval
+                if not controller.events:
+                    next_arrival = schedulers[instance_id].get_next_arrival_time(current)
+                    if next_arrival is not None:
+                        controller.submit_event(next_arrival, sys)
+                    # If no arrival and no events, loop will terminate via done check
+            else:
+                controller.write_flush(p, "pass")
         
         # flush
         flush.stdout.flush()

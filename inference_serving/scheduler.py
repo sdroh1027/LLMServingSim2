@@ -617,7 +617,14 @@ class Scheduler:
     # get first request's arrival time
     def get_first_arrival_time(self):
         return self.first_arrival_time if self.first_arrival_time != 0 else 1 # need to add event handler at first
-    
+
+    def get_next_arrival_time(self, current):
+        """Return the arrival time of the next request after `current`, or None."""
+        for req in self.request:
+            if req.arrival > current:
+                return req.arrival
+        return None
+
     # merge requests in the request pool, ensuring they are sorted by arrival time
     def _merge_by_arrival_id(self, left, right):
         if not left:  

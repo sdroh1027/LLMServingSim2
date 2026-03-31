@@ -1,6 +1,8 @@
 import os
+import io
 import subprocess
 import re
+from contextlib import contextmanager
 from .request import *
 from .utils import *
 from .attn_utils import *
@@ -17,6 +19,16 @@ from math import ceil
 import sklearn
 import joblib
 import pickle
+
+
+@contextmanager
+def _open_or_buf(path, buf=None):
+    """Write to an in-memory buffer when *buf* is given, otherwise to *path*."""
+    if buf is not None:
+        yield buf
+    else:
+        with open(path, 'w') as f:
+            yield f
 
 # ----------------------------------------------------------------------
 # Global in-memory cache for performance database
@@ -141,9 +153,94 @@ def generate_trace(batch, hardware, npu_num, npu_group, pd_type=None, node_id=0,
                 f.write(formatter(' '.join(result[i]),'','','','','','','','','',''))
     return
 
+
+def generate_trace_bypass(batch, hardware, npu_num, npu_group, pd_type=None, node_id=0, instance_id=0,
+                           max_num_batched_tokens=2048, placement={}, block_mode_on=False, expert_routing_policy="RR",
+                           enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
+                           enable_attn_prediction=False, enable_sub_batch_interleaving=False, fp=16):
+    """generate_trace() variant for --bypass-astrasim: returns layer data in-memory.
+
+    Skips the final file rewrite (write #2) and returns the layer list
+    directly so that compute_trace_cycles_mem() can consume it without
+    an additional file read.
+
+    Returns:
+        list[list[str]]: each element is a tokenised layer row
+                         (same format as the rows written to the trace .txt).
+                         Returns empty list for empty batches.
+    """
+    model = batch.model
+    config = get_config(model)
+    fp = fp // 8  # bit -> byte of floating point
+    max_len = min(max_num_batched_tokens, config['max_position_embeddings'])
+
+    load_size = batch.load
+    evict_size = batch.evict
+
+    output_path = f"inputs/trace/{hardware}/{batch.model}/instance{instance_id}_batch{batch.batch_id}.txt"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    if 'num_local_experts' in config:
+        gate = GateRouter(node_id, instance_id, config.get('num_local_experts', 1),
+                num_experts_per_tok=config.get('num_experts_per_tok', 1),
+                routing_policy=expert_routing_policy,
+                seed=42)
+    else:
+        gate = None
+
+    if power_model is not None:
+        power_model.reset_log()
+
+    if batch.total_len == 0 and len(batch.requests) == 0:
+        logger.error(
+            "Batch #%d has total_len=0 and no requests — skipping trace generation. "
+            "This indicates an empty batch was dispatched (possible scheduler bug).",
+            batch.batch_id,
+            extra={"node_id": node_id, "instance_id": instance_id},
+        )
+        return []
+
+    # Write to in-memory buffer instead of file (eliminates all file I/O)
+    buf = io.StringIO()
+    if not enable_sub_batch_interleaving:
+        _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batch, max_len, output_path,
+                        placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp,
+                        _file_obj=buf)
+    else:
+        batches = _make_sub_batch(batch)
+        if len(batches) < 2 or len(batches[0].requests) == 0 or len(batches[1].requests) == 0:
+            _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batch, max_len, output_path,
+                        placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp,
+                        _file_obj=buf)
+        else:
+            _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batches, max_len, output_path,
+                        placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp,
+                        _file_obj=buf)
+
+    # Parse from in-memory buffer (no file read needed)
+    dic = [line.split() for line in buf.getvalue().splitlines()]
+
+    # Prepend kv_load / kv_evict entries
+    mem = []
+    if load_size != 0:
+        mem.append(["kv_load", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(load_size), 'LOCAL', '0', 'NONE', '0', 'NONE'])
+        if power_model is not None:
+            power_model.add_dram_energy_consumption(node_id, load_size)
+    if evict_size != 0:
+        mem.append(["kv_evict", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(evict_size), 'LOCAL', '0', 'NONE', '0', 'NONE'])
+        if power_model is not None:
+            power_model.add_dram_energy_consumption(node_id, evict_size)
+
+    if power_model is not None:
+        power_model.print_log(node_id)
+
+    # Skip final file rewrite — return layer data directly (eliminates write #2)
+    return mem + dic
+
 # Generates trace for the batch
 def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batch, max_len, output_path,
-                     placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp):
+                     placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp,
+                     _file_obj=None):
     
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
@@ -203,7 +300,7 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
         extra={"node_id": node_id, "instance_id": instance_id},
     )
 
-    with open(output_path, 'w') as f: # TODO: 특정 모델의 경우 수정해야 할 수 도 있음
+    with _open_or_buf(output_path, _file_obj) as f: # TODO: 특정 모델의 경우 수정해야 할 수 도 있음
         # embedding layer
         embedding_matching_row = _get_perf_row(perf_db, hardware, "embedding", total_len, 0, npus_per_group)
         emb_input, emb_weight, emb_output = calculate_sizes(model, embedding_matching_row["layer_name"], total_len, fp=fp)
@@ -551,7 +648,8 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
 
 # Generates trace for two sub-batches to maximize hardware utilization
 def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, pd_type, node_id, instance_id, batches, max_len, output_path,
-                     placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp):
+                     placement, block_mode_on, gate, enable_prefix_caching, enable_attn_offloading, power_model, pim_model, enable_attn_prediction, fp,
+                     _file_obj=None):
     
     num_hidden_layers = config['num_hidden_layers']
     n_embd = config['hidden_size']
@@ -634,7 +732,7 @@ def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, p
         extra={"node_id": node_id, "instance_id": instance_id},
     )
 
-    with open(output_path, 'w') as f:
+    with _open_or_buf(output_path, _file_obj) as f:
         # Batch 1 Embd -> QKV -> Attn
         # embedding layer
         embedding_matching_row = _get_perf_row(perf_db, hardware, "embedding", total_len_1, 0, npus_per_group)
