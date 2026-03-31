@@ -357,7 +357,10 @@ def main():
                 print(f"{log_indent+tree_indent}Running Instance[{inst_id}]: {running_reqs} reqs,", end=' ')
                 print(f"Total # {schedulers[inst_id].npu_num} NPUs, Each NPU Memory Usage {npu_used_mb:.2f} MB ({npu_util:.3f} % Used)", end='')
                 if enable_prefix_caching:
-                    schedulers[inst_id].memory.npu_prefix_cache.print_prefix_info()
+                    npu_cache = schedulers[inst_id].memory.npu_prefix_cache
+                    npu_req, npu_hit = npu_cache.return_prefix_info()
+                    if npu_req > 0:
+                        print(f", GPU Hit {npu_hit/npu_req*100:.2f}% ({npu_hit}/{npu_req})", end='')
                 print()
             
             ######### Per Node Metrics #########
@@ -377,9 +380,18 @@ def main():
                     cpu_util = (node_cpu_usage / (cpu_mem_size[node_id]*GB_TO_BYTE)) * 100
                     if prefix_storage != "CXL" and not power_modeling and i == num_nodes - 1:
                         tree_indent = '└─'
-                    print(f"{log_indent+tree_indent}Node[{node_id}]: Total CPU Memory Usage {node_cpu_usage/MB_TO_BYTE:.2f} MB, {cpu_util:.3f} % Used ", end='')
+                    print(f"{log_indent+tree_indent}Node[{node_id}]: Total CPU Memory Usage {node_cpu_usage/MB_TO_BYTE:.2f} MB, {cpu_util:.3f} % Used", end='')
                     if enable_prefix_caching and enable_prefix_sharing and prefix_storage == "CPU":
-                        prefix_pools[node_id].print_prefix_info()
+                        cpu_req, cpu_hit = prefix_pools[node_id].return_prefix_info()
+                        if cpu_req > 0:
+                            print(f", CPU Hit {cpu_hit/cpu_req*100:.2f}% ({cpu_hit}/{cpu_req})", end='')
+                    elif enable_prefix_caching and not enable_prefix_sharing and prefix_storage != "None":
+                        # non-sharing: per-instance second_tier hit
+                        for iid in inst_ids:
+                            st_cache = schedulers[iid].memory.second_tier_prefix_cache
+                            st_req, st_hit = st_cache.return_prefix_info()
+                            if st_req > 0:
+                                print(f", CPU Hit {st_hit/st_req*100:.2f}% ({st_hit}/{st_req})", end='')
 
                     if (enable_prefix_sharing and prefix_storage == "CPU") or (len(inst_ids) == 1):
                         print()
@@ -404,15 +416,20 @@ def main():
                         cxl_util = cxl_usage / cxl_pool.capacity
                         if not power_modeling and i == num_prefix_pool - 1:
                             tree_indent = '└─'
-                        print(f"{log_indent+tree_indent}CXL[{cxl_id}]: Total CXL Device Memory Usage {cxl_usage/MB_TO_BYTE:.2f}MB, {cxl_util:.3f} % Used")
+                        cxl_req, cxl_hit = cxl_pool.return_prefix_info()
+                        cxl_hit_str = f", CXL Hit {cxl_hit/cxl_req*100:.2f}% ({cxl_hit}/{cxl_req})" if cxl_req > 0 else ""
+                        print(f"{log_indent+tree_indent}CXL[{cxl_id}]: Total CXL Device Memory Usage {cxl_usage/MB_TO_BYTE:.2f}MB, {cxl_util:.3f} % Used{cxl_hit_str}")
                 else:
                     # else only one instance could explictly use CXL
                     inst_id = 0
-                    cxl_usage = (schedulers[inst_id].memory.second_tier_prefix_cache.total_size() * 131072)
-                    cxl_util = cxl_usage / schedulers[inst_id].memory.second_tier_prefix_cache.capacity
+                    cxl_cache = schedulers[inst_id].memory.second_tier_prefix_cache
+                    cxl_usage = (cxl_cache.total_size() * 131072)
+                    cxl_util = cxl_usage / cxl_cache.capacity
+                    cxl_req, cxl_hit = cxl_cache.return_prefix_info()
+                    cxl_hit_str = f", CXL Hit {cxl_hit/cxl_req*100:.2f}% ({cxl_hit}/{cxl_req})" if cxl_req > 0 else ""
                     if not power_modeling:
                         tree_indent = '└─'
-                    print(f"{log_indent+tree_indent}CXL[0]: Total CXL Device Memory Usage {cxl_usage / MB_TO_BYTE:.2f} MB, {cxl_util:.3f} % Used")
+                    print(f"{log_indent+tree_indent}CXL[0]: Total CXL Device Memory Usage {cxl_usage / MB_TO_BYTE:.2f} MB, {cxl_util:.3f} % Used{cxl_hit_str}")
 
             if power_modeling:
                 tree_indent = '└─'
@@ -502,12 +519,14 @@ def main():
         print(magenta(center("Prefix Caching Results")))
         print(SINGLE_BAR)
         print(f"Total requested prompt tokens:                                      {total_requested_tokens}")
-        print(f"NPU prefix hit prompt tokens:                                       {total_npu_hit_tokens}")
-        print(f"NPU prefix hit ratio (%):                                           {(total_npu_hit_tokens/total_requested_tokens)*100:.2f}")
+        print(f"GPU prefix hit tokens:                                              {total_npu_hit_tokens}")
+        print(f"GPU prefix hit ratio (%):                                           {(total_npu_hit_tokens/total_requested_tokens)*100:.2f}")
         if prefix_storage != "None":
-            print(f"{prefix_storage} prefix hit prompt tokens:                                       {total_cpu_hit_tokens}")
+            print(f"{prefix_storage} prefix hit tokens:                                              {total_cpu_hit_tokens}")
             print(f"{prefix_storage} prefix hit ratio (%):                                           {(total_cpu_hit_tokens/total_requested_tokens)*100:.2f}")
-        print(f"Total prefix hit ratio (%):                                         {((total_npu_hit_tokens+total_cpu_hit_tokens)/total_requested_tokens)*100:.2f}")
+        total_hit = total_npu_hit_tokens + total_cpu_hit_tokens
+        print(f"Total prefix hit tokens:                                            {total_hit}")
+        print(f"Total prefix hit ratio (%):                                         {(total_hit/total_requested_tokens)*100:.2f}")
         print(SINGLE_BAR)
     if power_modeling:
         print(magenta(center("Power Modeling Results")))
@@ -518,6 +537,16 @@ def main():
         power_model.print_power_summary()
         print(f"Power per {1/RATIO} sec (W): {power_model.power_time_series}")
         print(SINGLE_BAR)
+    # Peak KV memory usage
+    print(magenta(center('Peak KV Memory Usage')))
+    print(SINGLE_BAR)
+    GB = 1024 * 1024 * 1024
+    for i in range(num_instances):
+        mem = schedulers[i].memory
+        print(f"Instance [{i}]  GPU: {mem.peak_npu_kv / GB:.2f} GB  "
+              f"CPU: {mem.peak_cpu_kv / GB:.2f} GB  "
+              f"CXL: {mem.peak_cxl_kv / GB:.2f} GB")
+    print(SINGLE_BAR)
     # Each instacne results
     for i in range(num_instances):
         print(magenta(center(f"Instance [{i}]")))
