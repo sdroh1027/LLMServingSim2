@@ -47,6 +47,11 @@ class MemoryModel():
         self.weight = self.get_weight() # assume weight is loaded
         self.npu_used = self.weight
         self.cpu_used = 0
+
+        # Peak KV memory tracking (excludes model weight for NPU)
+        self.peak_npu_kv = 0
+        self.peak_cpu_kv = 0
+        self.peak_cxl_kv = 0
         if self.weight > self.npu_mem:
             raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.npu_num//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.npu_num//GB_TO_BYTE}GB")
 
@@ -228,9 +233,14 @@ class MemoryModel():
                 (self.npu_used + size) / MB_TO_BYTE,
             )
             self.npu_used += size
+            npu_kv = self.npu_used - self.weight
+            if npu_kv > self.peak_npu_kv:
+                self.peak_npu_kv = npu_kv
         elif device == Device.CPU:
             if self.prefix_storage == Device.CPU and self.enable_prefix_sharing:
                 self.second_tier_prefix_cache.allocate(size)
+                if self.second_tier_prefix_cache.total_memory_usage() > self.peak_cpu_kv:
+                    self.peak_cpu_kv = self.second_tier_prefix_cache.total_memory_usage()
             else:
                 if self.cpu_used + size > self.cpu_mem:
                     raise RuntimeError(
@@ -244,8 +254,12 @@ class MemoryModel():
                     (self.cpu_used + size) / MB_TO_BYTE,
                 )
                 self.cpu_used += size
+                if self.cpu_used > self.peak_cpu_kv:
+                    self.peak_cpu_kv = self.cpu_used
         elif device == Device.CXL:
             self.second_tier_prefix_cache.allocate(size)
+            if self.second_tier_prefix_cache.total_memory_usage() > self.peak_cxl_kv:
+                self.peak_cxl_kv = self.second_tier_prefix_cache.total_memory_usage()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to allocate KV cache in unsupported device {device}")
     
