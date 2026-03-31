@@ -595,6 +595,16 @@ class Scheduler:
     # add a request
     def add_request(self, req, is_init=True):
         new_req = Request(*(req), is_init=is_init)
+        if new_req.is_init and new_req.input > self.max_num_batched_tokens:
+            self.logger.error(
+                "Request #%d has input_length=%d which exceeds max_num_batched_tokens=%d. "
+                "Increase --max-batched-tokens or filter out oversized requests.",
+                new_req.id, new_req.input, self.max_num_batched_tokens,
+            )
+            raise ValueError(
+                f"Request #{new_req.id} input_length={new_req.input} exceeds "
+                f"max_num_batched_tokens={self.max_num_batched_tokens}"
+            )
         self.request.append(new_req)
         return
     
