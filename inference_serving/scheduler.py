@@ -422,7 +422,7 @@ class Scheduler:
                     self.memory.evict_prefix_cache(storage_evict_size, self.prefix_storage)
 
             for req in batch_req:
-                # Update the prefix cache for incoming batch
+                # Add generated prefix cache to kv cache memory (prefill/decode both)
                 self.memory.cache_unfinished_req(req, Device.NPU)
                 if self.prefix_storage is not None:
                     self.memory.cache_unfinished_req(req, self.prefix_storage)

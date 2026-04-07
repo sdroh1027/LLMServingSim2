@@ -64,18 +64,24 @@ def formatter(layername, comp_time, input_loc, input_size, weight_loc, weight_si
     return _FMT.format(layername, comp_time, input_loc, input_size, weight_loc, weight_size, output_loc, output_size, comm_type, comm_size, misc)
 
 
+_config_cache = {}
+
 def get_config(model_name):
 
+    if model_name in _config_cache:
+        return _config_cache[model_name]
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    parent_dir = os.path.dirname(base_dir)    
+    parent_dir = os.path.dirname(base_dir)
     config_path = os.path.join(parent_dir, "model_config", model_name + ".json")
-    
+
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
     except FileNotFoundError:
         raise FileNotFoundError(f"Config file for model '{model_name}' not found at {config_path}. Please add the corresponding config file.")
-    
+
+    _config_cache[model_name] = config
     return config
 
 def print_logo():

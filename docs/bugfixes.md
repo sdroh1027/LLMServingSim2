@@ -91,6 +91,44 @@ if npu_result.last_device_node is not None:
 ```
 
 
+### 7. CXL prefix cache eviction 미지원 + 로그 메모리 사용량 하드코딩
+
+> 수정일: 2026-04-07
+
+**파일**: `inference_serving/memory_model.py`, `main.py`
+
+**증상 1**: `--prefix-storage CXL` 사용 시 CXL 공간 부족하면 `RuntimeError: Trying to evict prefix cache to unsupported device Device.CXL`
+
+**원인**: `evict_prefix_cache()`에 `Device.CXL` 분기 누락. `Device.CPU`만 처리.
+
+**수정**: `elif device == Device.CPU:` → `elif device == Device.CPU or device == Device.CXL:`
+
+**증상 2**: CXL/CPU 로그의 메모리 사용량이 실제와 다름 (0.3% 표시 → 실제 62%)
+
+**원인**: `total_size() * 131072` 하드코딩. `total_size()`는 토큰 수인데 모델별 kv_size 대신 고정 상수 사용. 또한 `cxl_util` 계산 시 `* 100` 누락.
+
+**수정**: `total_memory_usage()` 사용 + `cxl_util`에 `* 100` 추가 (3곳)
+
+### 8. `storage_cache_evicted_req` NPU lock 누수
+
+> 수정일: 2026-04-07
+
+**파일**: `inference_serving/memory_model.py`
+
+**증상**: prefix_storage 사용 시 evicted request의 NPU radix tree 노드에 lock이 영구적으로 남아 해당 prefix가 eviction 대상에서 제외됨.
+
+**원인**: `storage_cache_evicted_req()`에서 evicted req의 KV cache를 CPU/CXL에 저장한 뒤, NPU radix tree에 `inc_lock_ref()`를 호출하지만 해당 노드를 `req.npu_last_node`에 저장하지 않음. 이후 어디서도 `dec_lock_ref()`가 호출되지 않아 lock 누수 발생.
+
+**수정**: NPU lock 대신 CPU/CXL(`second_tier_prefix_cache`) lock으로 변경. 재스케줄 시 `unlock_prefix(req, Device.CPU)`와 올바르게 쌍을 이룸.
+
+```python
+# Before (NPU lock — leaked)
+self.npu_prefix_cache.inc_lock_ref(new_last_node)
+
+# After (CPU/CXL lock — paired with unlock at re-scheduling)
+self.second_tier_prefix_cache.inc_lock_ref(new_last_node)
+```
+
 ## 미수정 (알려진 문제)
 
 ### 1. Prefill attention의 kv_cache_size 미반영

@@ -30,6 +30,9 @@ try:
 except ImportError:
     msgspec = None
 from .logger import get_logger
+import logging
+
+_rtlog = logging.getLogger("radix_tree.perf")
 
 GB_TO_BYTE = 1024 * 1024 * 1024
 MB_TO_BYTE = 1024 * 1024
@@ -337,9 +340,11 @@ class RadixCache():
                 continue
 
             num_evicted += len(x.key)
+            parent = x.parent
             self._delete_leaf(x)
-            if len(x.parent.children) == 0:
-                heapq.heappush(leaves, x.parent)
+            self._try_compact(parent)
+            if len(parent.children) == 0:
+                heapq.heappush(leaves, parent)
 
             self._record_remove_event(x)
 
@@ -392,7 +397,7 @@ class RadixCache():
 
     def _match_prefix_helper(self, node: TreeNode, key: List) -> tuple[int, TreeNode]:
         node.last_access_time = time.monotonic()
-        
+
         if len(key) == 0:
             return 0, node
 
@@ -402,6 +407,7 @@ class RadixCache():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
+
             if prefix_len < len(child.key):
                 matched += prefix_len
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -418,7 +424,6 @@ class RadixCache():
         return matched, node
 
     def _split_node(self, key, child: TreeNode, split_len: int):
-        # new_node -> child
         new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
@@ -509,6 +514,42 @@ class RadixCache():
                 break
         del node.parent.children[k]
         self.evictable_size_ -= len(node.key)
+
+    def _try_compact(self, node: TreeNode):
+        """Merge node with its only child if it has exactly one child.
+
+        After a leaf deletion, the parent may end up with a single child,
+        creating an unnecessary intermediate node.  Compacting keeps the
+        radix tree shallow and prevents O(N) traversals.
+        """
+        if node == self.root_node:
+            return
+        if len(node.children) != 1:
+            return
+        # Do not compact if the node is locked (referenced by in-flight requests)
+        if node.lock_ref > 0:
+            return
+
+        only_child = next(iter(node.children.values()))
+
+        # Merge keys: node.key + only_child.key
+        only_child.key = node.key + only_child.key
+
+        # Merge hash_value
+        if node.hash_value is not None or only_child.hash_value is not None:
+            parent_hv = node.hash_value if node.hash_value is not None else []
+            child_hv = only_child.hash_value if only_child.hash_value is not None else []
+            merged = parent_hv + child_hv
+            only_child.hash_value = merged if merged else None
+
+        # Transfer lock_ref from node to child (node.lock_ref == 0 guaranteed above)
+
+        # Re-link: grandparent -> only_child (skip node)
+        only_child.parent = node.parent
+        for k, v in node.parent.children.items():
+            if v == node:
+                node.parent.children[k] = only_child
+                break
 
     def _collect_leaves(self):
         ret_list = []
