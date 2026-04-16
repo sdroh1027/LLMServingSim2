@@ -51,7 +51,8 @@ def generate_arrival_times(n: int, rate: float, seed: int = 42) -> list:
 
 
 def convert(input_path: str, output_path: str, tokenizer_name: str, tokenizer,
-            num_req: int, arrival_rate: float, seed: int = 42, repeat: int = 1):
+            num_req: int, arrival_rate: float, seed: int = 42, repeat: int = 1,
+            random_repeat: bool = False):
 
     raw_rows = []
     with open(input_path, encoding="utf-8") as f:
@@ -67,9 +68,17 @@ def convert(input_path: str, output_path: str, tokenizer_name: str, tokenizer,
         print(f"[error] No data found in {input_path}", file=sys.stderr)
         sys.exit(1)
 
-    # repeat: 동일한 행을 repeat회 반복 (KV cache hit 측정용)
-    rows = raw_rows * repeat
-    print(f"[convert] {len(raw_rows)} entries × {repeat} repeat = {len(rows)} total, tokenizing...")
+    # repeat: rep1 = 원본 순서, rep2~ = random sampling (random_repeat) 또는 동일 순서
+    rng = random.Random(seed)
+    rows = list(raw_rows)  # rep1: 원본 순서
+    for r in range(1, repeat):
+        if random_repeat:
+            sampled = [rng.choice(raw_rows) for _ in range(len(raw_rows))]
+            rows.extend(sampled)
+        else:
+            rows.extend(raw_rows)
+    mode_str = "random sampling" if random_repeat else "exact copy"
+    print(f"[convert] {len(raw_rows)} entries × {repeat} repeat ({mode_str}) = {len(rows)} total, tokenizing...")
 
     arrival_times = generate_arrival_times(len(rows), arrival_rate, seed)
 
@@ -83,6 +92,7 @@ def convert(input_path: str, output_path: str, tokenizer_name: str, tokenizer,
         "source_dataset": str(input_path),
         "num_req": num_req,
         "repeat": repeat,
+        "random_repeat": random_repeat,
         "total_req": len(rows),
         "arrival_rate_req_per_sec": arrival_rate,
         "seed": seed,
@@ -147,10 +157,12 @@ def main():
                         help="포아송 도착률 req/sec (default: 1.0)")
     parser.add_argument("--seed",         type=int, default=42, help="랜덤 시드")
     parser.add_argument("--repeat",       type=int, default=1,  help="데이터셋을 반복할 횟수 (default: 1, KV cache hit 측정용)")
+    parser.add_argument("--random-repeat", action="store_true", default=False,
+                        help="rep2부터 random sampling으로 반복 (default: 동일 순서 반복)")
     args = parser.parse_args()
 
     tokenizer_name, tokenizer = load_tokenizer(args.model)
-    convert(args.input, args.output, tokenizer_name, tokenizer, args.num_req, args.arrival_rate, args.seed, args.repeat)
+    convert(args.input, args.output, tokenizer_name, tokenizer, args.num_req, args.arrival_rate, args.seed, args.repeat, args.random_repeat)
 
 
 if __name__ == "__main__":
