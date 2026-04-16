@@ -7,7 +7,7 @@
             "num_instances": 1,
             "cpu_mem":
                 {
-                    "mem_size": 1024,
+                    "mem_size": 352,
                     "mem_bw": 512,
                     "mem_latency": 0
                 },
@@ -23,9 +23,25 @@
                         },
                     "npu_num": 1,
                     "npu_group": 1,
-                    "pd_type": null
+                    "pd_type": null,
+                    "placement":
+                        {
+                            "default":
+                                {
+                                    "weights": "npu",
+                                    "kv_loc": "npu",
+                                    "kv_evict_loc": "cxl"
+                                }
+                        }
                 }
             ]
         }
-    ]
+    ],
+    "cxl_mem":
+        {
+            "mem_size": 2560,
+            "mem_bw": 16,
+            "mem_latency": 5000,
+            "num_devices": 1
+        }
 }

@@ -3,7 +3,8 @@
   "source_dataset": "../LVEval/data/hotpotwikiqa_mixup/hotpotwikiqa_mixup_16k.jsonl",
   "num_req": 9999,
   "repeat": 5,
+  "random_repeat": true,
   "total_req": 620,
-  "arrival_rate_req_per_sec": 1.0,
+  "arrival_rate_req_per_sec": 10.0,
   "seed": 42
 }

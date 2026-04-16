@@ -7,7 +7,7 @@
             "num_instances": 1,
             "cpu_mem":
                 {
-                    "mem_size": 480,
+                    "mem_size": 352,
                     "mem_bw": 512,
                     "mem_latency": 0
                 },
@@ -42,6 +42,6 @@
             "mem_size": 2560,
             "mem_latency": 500,
             "mem_bw": 19.5,
-            "num_devices": 1
+            "num_devices": 10
         }
 }

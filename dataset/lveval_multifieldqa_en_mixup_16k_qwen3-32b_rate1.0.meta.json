@@ -1,7 +1,0 @@
-{
-  "tokenizer_model": "Qwen/Qwen3-32B",
-  "source_dataset": "../LVEval/data/multifieldqa_en_mixup/multifieldqa_en_mixup_16k.jsonl",
-  "num_req": 9999,
-  "arrival_rate_req_per_sec": 1.0,
-  "seed": 42
-}
