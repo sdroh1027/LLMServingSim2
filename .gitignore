@@ -11,8 +11,13 @@ __pycache__/
 
 output/
 
-# Ignore large LVEval trace dataset files (use meta.json instead)
+# Ignore large trace dataset files
 dataset/lveval_*.jsonl
+dataset/lveval_*.meta.json
+dataset/qwen_traceA_*.jsonl
+dataset/qwen_traceA_*.meta.json
 
 # Ignore simulation output CSV files
 output_*.csv
+
+*.txt

@@ -43,10 +43,11 @@ class Scheduler:
         self.first_arrival_time = 0
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem)
+        self.memory = MemoryModel(model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, max_num_batched_tokens=self.max_num_batched_tokens)
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
+        self._consecutive_sched_failures = 0
     
  
     def schedule(self, current, sys, batch_id=-1):
@@ -189,8 +190,7 @@ class Scheduler:
                     req.set_que_delay(current)
                     q_list.append(req.input)
                     prefill_q_list.append(req.input)
-                    # For now, we don't assume chunked prefill
-                    prefill_k_list.append(0)
+                    prefill_k_list.append(req.prefix_cache_hit) # sidong: prefix cache hit 반영
                     num_prefill += 1
                 else:
                     total_len += 1
@@ -259,6 +259,16 @@ class Scheduler:
             # can make batch and proceed
             batch_req = batch_req[:batch_len]
 
+            # Cap batch_len so that batched initial reqs does not overly consume KV capacity
+            _kv_budget = self.memory.mem_for_kv
+            _kv_accum = 0
+            for i in range(batch_len):
+                _kv_accum += self.memory.get_kv(batch_req[i].input)
+                if _kv_accum > _kv_budget:
+                    batch_len = max(i, 1)
+                    batch_req = batch_req[:batch_len]
+                    break
+
             if self.prioritize_prefill:
                 prefill_req = [req for req in batch_req if req.is_init]
 
@@ -285,7 +295,34 @@ class Scheduler:
                 if total_useable_size >= kv_size:
                     temp_len = i
                     break
-            
+
+            # ---- diagnostic ----
+            _MB = 1024 * 1024
+            if temp_len == 0:
+                self._consecutive_sched_failures += 1
+                self.logger.warning(
+                    "[DIAG] temp_len=0 (consecutive=%d) batch=%d(init=%d,dec=%d) "
+                    "useable=%.1fMB(avail=%.1f+evict=%.1f) npu_used=%.1f npu_mem=%.1f "
+                    "prot=%d_tok evict=%d_tok kv_for_1=%.1fMB",
+                    self._consecutive_sched_failures,
+                    batch_len, batch_len - len(gen_req), len(gen_req),
+                    total_useable_size/_MB,
+                    self.memory.avail_size(Device.NPU)/_MB,
+                    self.memory.evictable_size(Device.NPU)/_MB,
+                    self.memory.npu_used/_MB, self.memory.npu_mem/_MB,
+                    self.memory.npu_prefix_cache.protected_size(),
+                    self.memory.npu_prefix_cache.evictable_size(),
+                    self.memory.get_block_kv(batch_req, 1)/_MB if batch_len > 0 else 0,
+                )
+            else:
+                if self._consecutive_sched_failures > 0:
+                    self.logger.warning(
+                        "[DIAG] recovered after %d consecutive failures, temp_len=%d",
+                        self._consecutive_sched_failures, temp_len,
+                    )
+                    self._consecutive_sched_failures = 0
+            # ---- end diagnostic ----
+
             evicted_req = []
             # no memory to batch
             while temp_len == 0:
@@ -434,9 +471,9 @@ class Scheduler:
                     q_list.append(max(req.input - req.prefix_cache_hit, 1))
                     num_prefill += 1
                     prefill_q_list.append(max(req.input - req.prefix_cache_hit, 1))
-                    prefill_k_list.append(0)
+                    prefill_k_list.append(req.prefix_cache_hit) # sidong: prefix cache hit 반영
                 else:
-                    total_len += 1    
+                    total_len += 1
                     q_list.append(1)
                     num_decode += 1
                     kv_len += req.input
@@ -555,7 +592,7 @@ class Scheduler:
                 gen_t += 1
                 req.add_itl(finish)
 
-            req.input += 1
+            req.input += 1  # req.input simulates the generation of one token, so add 1 here
 
             # check done
             if req.output <= req.input:
@@ -579,7 +616,7 @@ class Scheduler:
         if self.prioritize_prefill:
             self.request = self._merge_by_arrival_id(pool, self.request)
         else:
-            self.request = pool + self.request
+            self.request = pool + self.request # prioritize decode request in the next batch
 
         del self.inflight[idx]
         del batch

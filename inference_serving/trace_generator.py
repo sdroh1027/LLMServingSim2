@@ -419,7 +419,7 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
                         attn_latency_ns = int(attn_matching_row["latency(ns)"])
                 else:
                     # Attention
-                    prefill_key, decode_key = _make_attn_db_key(
+                    prefill_keys, decode_key = _make_attn_db_key(
                         hardware=hardware,
                         model=model,
                         batch=batch
@@ -427,15 +427,12 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
                     if decode_key != (0,0):
                         decode_attn_matchin_row = _get_attn_perf_row(decode_perf_db, decode_key)
                         decode_attn_latency = int(decode_attn_matchin_row['latency(ns)'])
-                        # print(f"decode db key {decode_key}")
                     else:
                         decode_attn_latency = 0
-                    if prefill_key != (0,0):
-                        prefill_attn_matchin_row = _get_attn_perf_row(prefill_perf_db, prefill_key)
-                        prefill_attn_latency = int(prefill_attn_matchin_row['latency(ns)'])
-                        # print(f"prefill db key {prefill_key}")
-                    else:
-                        prefill_attn_latency = 0
+                    prefill_attn_latency = 0
+                    for pkey in prefill_keys:
+                        row = _get_attn_perf_row(prefill_perf_db, pkey)
+                        prefill_attn_latency += int(row['latency(ns)'])
 
                     attn_latency_ns =  prefill_attn_latency + decode_attn_latency
 
@@ -841,16 +838,15 @@ def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, p
                 # attn_matching_row = _get_perf_row(perf_db, "attn", attn_len_1, kv_len_1, npus_per_group)
                 # attn_latency_ns = attn_matching_row['latency(ns)']
 
-                prefill_key, decode_key = _make_attn_db_key(
+                prefill_keys, decode_key = _make_attn_db_key(
                     hardware=hardware,
                     model=model,
                     batch=batches[0],
                 )
-                if prefill_key != (0,0):
-                    prefill_attn_matchin_row = _get_attn_perf_row(prefill_perf_db, prefill_key)
-                    prefill_attn_latency = int(prefill_attn_matchin_row['latency(ns)'])
-                else:
-                    prefill_attn_latency = 0
+                prefill_attn_latency = 0
+                for pkey in prefill_keys:
+                    row = _get_attn_perf_row(prefill_perf_db, pkey)
+                    prefill_attn_latency += int(row['latency(ns)'])
                 if decode_key != (0,0):
                     decode_attn_matchin_row = _get_attn_perf_row(decode_perf_db, decode_key)
                     decode_attn_latency = int(decode_attn_matchin_row['latency(ns)'])
@@ -858,7 +854,7 @@ def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, p
                     decode_attn_latency = 0
 
                 attn_latency_ns =  prefill_attn_latency + decode_attn_latency
-                
+
             f.write(formatter("attn", str(attn_latency_ns), 'LOCAL', str(attn_input), get_device(placement, 0, "attn", "weights"), str(attn_weight), 'LOCAL', str(attn_output), 'NONE', '0', 'BATCH_1'))
 
             if power_model is not None:
@@ -973,16 +969,15 @@ def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, p
                 # attn_matching_row = _get_perf_row(perf_db, "attn", attn_len_2, kv_len_2, npus_per_group)
                 # attn_latency_ns = attn_matching_row['latency(ns)']
 
-                prefill_key, decode_key = _make_attn_db_key(
+                prefill_keys, decode_key = _make_attn_db_key(
                     hardware=hardware,
                     model=model,
                     batch=batches[1],
                 )
-                if prefill_key != (0,0):
-                    prefill_attn_matchin_row = _get_attn_perf_row(prefill_perf_db, prefill_key)
-                    prefill_attn_latency = int(prefill_attn_matchin_row['latency(ns)'])
-                else:
-                    prefill_attn_latency = 0
+                prefill_attn_latency = 0
+                for pkey in prefill_keys:
+                    row = _get_attn_perf_row(prefill_perf_db, pkey)
+                    prefill_attn_latency += int(row['latency(ns)'])
                 if decode_key != (0,0):
                     decode_attn_matchin_row = _get_attn_perf_row(decode_perf_db, decode_key)
                     decode_attn_latency = int(decode_attn_matchin_row['latency(ns)'])
@@ -990,7 +985,7 @@ def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, p
                     decode_attn_latency = 0
 
                 attn_latency_ns =  prefill_attn_latency + decode_attn_latency
-                
+
             f.write(formatter("attn", str(attn_latency_ns), 'LOCAL', str(attn_input), get_device(placement, 0, "attn", "weights"), str(attn_weight), 'LOCAL', str(attn_output), 'NONE', '0', 'BATCH_2'))
 
             if power_model is not None:
@@ -1251,16 +1246,15 @@ def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, p
                     # attn_matching_row = _get_perf_row(perf_db, "attn", attn_len_1, kv_len_1, npus_per_group)
                     # attn_latency_ns = attn_matching_row['latency(ns)']
 
-                    prefill_key, decode_key = _make_attn_db_key(
+                    prefill_keys, decode_key = _make_attn_db_key(
                         hardware=hardware,
                         model=model,
                         batch=batches[0],
                     )
-                    if prefill_key != (0,0):
-                        prefill_attn_matchin_row = _get_attn_perf_row(prefill_perf_db, prefill_key)
-                        prefill_attn_latency = int(prefill_attn_matchin_row['latency(ns)'])
-                    else:
-                        prefill_attn_latency = 0
+                    prefill_attn_latency = 0
+                    for pkey in prefill_keys:
+                        row = _get_attn_perf_row(prefill_perf_db, pkey)
+                        prefill_attn_latency += int(row['latency(ns)'])
                     if decode_key != (0,0):
                         decode_attn_matchin_row = _get_attn_perf_row(decode_perf_db, decode_key)
                         decode_attn_latency = int(decode_attn_matchin_row['latency(ns)'])
@@ -1268,7 +1262,7 @@ def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, p
                         decode_attn_latency = 0
 
                     attn_latency_ns =  prefill_attn_latency + decode_attn_latency
-                    
+
                 block_res.append(formatter("attn", str(attn_latency_ns), 'LOCAL', str(attn_input), get_device(placement, layer_num + 1, "attn", "weights"), str(attn_weight), 'LOCAL', str(attn_output), 'NONE', '0', 'BATCH_1'))
 
                 if power_model is not None:
@@ -1513,16 +1507,15 @@ def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, p
                     # attn_matching_row = _get_perf_row(perf_db, "attn", attn_len_2, kv_len_2, npus_per_group)
                     # attn_latency_ns = attn_matching_row['latency(ns)']
 
-                    prefill_key, decode_key = _make_attn_db_key(
+                    prefill_keys, decode_key = _make_attn_db_key(
                         hardware=hardware,
                         model=model,
                         batch=batches[1],
                     )
-                    if prefill_key != (0,0):
-                        prefill_attn_matchin_row = _get_attn_perf_row(prefill_perf_db, prefill_key)
-                        prefill_attn_latency = int(prefill_attn_matchin_row['latency(ns)'])
-                    else:
-                        prefill_attn_latency = 0
+                    prefill_attn_latency = 0
+                    for pkey in prefill_keys:
+                        row = _get_attn_perf_row(prefill_perf_db, pkey)
+                        prefill_attn_latency += int(row['latency(ns)'])
                     if decode_key != (0,0):
                         decode_attn_matchin_row = _get_attn_perf_row(decode_perf_db, decode_key)
                         decode_attn_latency = int(decode_attn_matchin_row['latency(ns)'])
@@ -1530,7 +1523,7 @@ def _synthesize_interleaved_trace(hardware, model, config, npu_num, npu_group, p
                         decode_attn_latency = 0
 
                     attn_latency_ns =  prefill_attn_latency + decode_attn_latency
-                    
+
                 block_res.append(formatter("attn", str(attn_latency_ns), 'LOCAL', str(attn_input), get_device(placement, layer_num + 1, "attn", "weights"), str(attn_weight), 'LOCAL', str(attn_output), 'NONE', '0', 'BATCH_1'))
 
                 if power_model is not None:
@@ -2018,9 +2011,9 @@ def _make_sub_batch(batch, enable_prefix_caching=False):
             q_list.append(max(req.input - req.prefix_cache_hit, 1))
             num_prefill += 1
             prefill_q_list.append(max(req.input - req.prefix_cache_hit, 1))
-            prefill_k_list.append(0)
+            prefill_k_list.append(req.prefix_cache_hit)
         else:
-            total_len += 1    
+            total_len += 1
             q_list.append(1)
             num_decode += 1
             kv_len += req.input
@@ -2053,15 +2046,15 @@ def _make_sub_batch(batch, enable_prefix_caching=False):
             q_list.append(max(req.input - req.prefix_cache_hit, 1))
             num_prefill += 1
             prefill_q_list.append(max(req.input - req.prefix_cache_hit, 1))
-            prefill_k_list.append(0)
+            prefill_k_list.append(req.prefix_cache_hit)
         else:
-            total_len += 1    
+            total_len += 1
             q_list.append(1)
             num_decode += 1
             kv_len += req.input
             decode_k_list.append(req.input)
         k_list.append(req.input)
-    
+
     # KV cache is just handled once
     batch2 = Batch(
         batch.batch_id, batch.model,
@@ -2328,13 +2321,16 @@ def _make_attn_db_key(hardware, model, batch):
     _kv_cache_prediction_granularity = 64
     _prefill_chunk_size_prediction_granularity = 32
     if batch.num_prefill > 0:
-        prefill_agg_kv_cache_size = sum(batch.prefill_k_list)
-        prefill_agg_kv_cache_size = ((prefill_agg_kv_cache_size + _kv_cache_prediction_granularity - 1) // _kv_cache_prediction_granularity) * _kv_cache_prediction_granularity
-        prefill_agg_chunk_size = round(sum([e**2 for e in batch.q_list])**0.5)
-        prefill_agg_chunk_size = (ceil(prefill_agg_chunk_size / _prefill_chunk_size_prediction_granularity)) * _prefill_chunk_size_prediction_granularity
-        prefill_key = (prefill_agg_kv_cache_size, prefill_agg_chunk_size)
+        # Per-request prefill keys: attention is independent per request
+        prefill_keys = []
+        for i in range(batch.num_prefill):
+            kv = batch.prefill_k_list[i]
+            kv = ((kv + _kv_cache_prediction_granularity - 1) // _kv_cache_prediction_granularity) * _kv_cache_prediction_granularity
+            q = batch.prefill_q_list[i]
+            q = (ceil(q / _prefill_chunk_size_prediction_granularity)) * _prefill_chunk_size_prediction_granularity
+            prefill_keys.append((kv, q))
     else:
-        prefill_key = (0,0)
+        prefill_keys = []
     if batch.num_decode > 0:
         decode_avg_kv_cache_size = int(np.mean(batch.decode_k_list))
         decode_avg_kv_cache_size = ((decode_avg_kv_cache_size + _kv_cache_prediction_granularity - 1) // _kv_cache_prediction_granularity) * _kv_cache_prediction_granularity
@@ -2342,7 +2338,7 @@ def _make_attn_db_key(hardware, model, batch):
     else:
         decode_key = (0,0)
 
-    return prefill_key, decode_key
+    return prefill_keys, decode_key
 
 ############### Helper Functions for Attention prediction ###############
 

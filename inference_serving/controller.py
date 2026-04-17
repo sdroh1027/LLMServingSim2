@@ -76,6 +76,10 @@ class BypassController():
         self.iteration[npu_id] += 1
         heapq.heappush(self.events, (finish_cycle_ns, npu_id, it))
 
+    def has_event_for_npu(self, npu_id):
+        """Check if any pending event exists for the given NPU."""
+        return any(e[1] == npu_id for e in self.events)
+
     def read_wait(self, p=None):
         """Pop next event from the queue (replaces AstraSim stdout read)."""
         if not self.events:
@@ -105,22 +109,58 @@ class BypassController():
         return None
 
 
-def _calc_transfer_ns(loc, data_size, link_bw_bpns, link_latency, cxl_bw_bpns, cxl_latency):
-    """Return transfer time (ns) for a single data access given its location tag.
+# ─────────────────────────────────────────────────────────────────────
+# Trace column layout:
+#   idx 0: layer_name
+#   idx 1: comp_time (ns)
+#   idx 2-3: input_loc, input_size      ┐
+#   idx 4-5: weight_loc, weight_size    ├─ memory transfer (LOCAL / REMOTE:N / CXL:N)
+#   idx 6-7: output_loc, output_size    ┘
+#   idx 8-9: comm_type, comm_size       ← TP collective (ALLREDUCE / ALLTOALL / NONE)
+#   idx 10:  misc
+#
+# Memory transfer: per-device bw/latency (cpu_mem, cxl_mem)
+# TP collective:   link_bw/link_latency (inter-node or NVLink)
+#   → only relevant when npu_num > 1 (bypass mode is single-node only,
+#     but the calculation is included for future multi-GPU support)
+# ─────────────────────────────────────────────────────────────────────
+
+def _calc_transfer_ns(loc, data_size, cpu_bw_bpns, cpu_latency, cxl_bw_bpns, cxl_latency):
+    """Return transfer time (ns) for a single memory access given its location tag.
 
     Supports REMOTE (CPU memory) and CXL device locations.
     Returns 0 for LOCAL or when bandwidth is not configured.
     """
     if data_size <= 0:
         return 0
-    if loc.startswith('REMOTE') and link_bw_bpns > 0:
-        return link_latency + int(data_size / link_bw_bpns)
+    if loc.startswith('REMOTE') and cpu_bw_bpns > 0:
+        return cpu_latency + int(data_size / cpu_bw_bpns)
     if loc.startswith('CXL') and cxl_bw_bpns > 0:
         return cxl_latency + int(data_size / cxl_bw_bpns)
     return 0
 
 
-def compute_trace_cycles(trace_path, link_bw=0, link_latency=0, cxl_bw=0, cxl_latency=0):
+def _calc_collective_ns(comm_type, comm_size, npu_num, link_bw_bpns, link_latency):
+    """Return TP collective communication time (ns).
+
+    Simplified ring-based model:
+      ALLREDUCE:  2 * (npu_num-1)/npu_num * data_size / link_bw + link_latency
+      ALLTOALL:   (npu_num-1)/npu_num * data_size / link_bw + link_latency
+      ALLGATHER:  (npu_num-1)/npu_num * data_size / link_bw + link_latency
+
+    Returns 0 when npu_num <= 1 or comm_type is NONE.
+    """
+    if npu_num <= 1 or comm_type == 'NONE' or link_bw_bpns <= 0 or comm_size <= 0:
+        return 0
+    ratio = (npu_num - 1) / npu_num
+    if comm_type == 'ALLREDUCE':
+        return link_latency + int(2 * ratio * comm_size / link_bw_bpns)
+    elif comm_type in ('ALLTOALL', 'ALLGATHER', 'REDUCESCATTER'):
+        return link_latency + int(ratio * comm_size / link_bw_bpns)
+    return 0
+
+
+def compute_trace_cycles(trace_path, cpu_bw=0, cpu_latency=0, cxl_bw=0, cxl_latency=0):
     """Read a trace .txt file and return total time in nanoseconds.
 
     Sums comp_time for all layers and adds exposed communication time
@@ -129,8 +169,8 @@ def compute_trace_cycles(trace_path, link_bw=0, link_latency=0, cxl_bw=0, cxl_la
 
     Args:
         trace_path: path to the trace .txt file
-        link_bw: inter-node link bandwidth in GB/s (0 = ignore REMOTE)
-        link_latency: per-access link latency in ns
+        cpu_bw: CPU memory bandwidth in GB/s (0 = ignore REMOTE)
+        cpu_latency: CPU memory access latency in ns
         cxl_bw: CXL device bandwidth in GB/s (0 = ignore CXL)
         cxl_latency: per-access CXL latency in ns
     """
@@ -142,11 +182,13 @@ def compute_trace_cycles(trace_path, link_bw=0, link_latency=0, cxl_bw=0, cxl_la
 
     num_layers = int(lines[1].strip())
     total_compute_ns = 0
-    total_comm_ns = 0
+    cpu_transfer_ns = 0
+    cxl_transfer_ns = 0
+    other_comm_ns = 0
     # GB/s  →  bytes per ns  (1 GB/s == 1 byte/ns)
-    link_bw_bpns = link_bw if link_bw > 0 else 0
+    cpu_bw_bpns = cpu_bw if cpu_bw > 0 else 0
     cxl_bw_bpns = cxl_bw if cxl_bw > 0 else 0
-    has_remote = link_bw_bpns > 0 or cxl_bw_bpns > 0
+    has_remote = cpu_bw_bpns > 0 or cxl_bw_bpns > 0
 
     for i in range(3, min(3 + num_layers, len(lines))):
         cols = lines[i].split()
@@ -164,44 +206,62 @@ def compute_trace_cycles(trace_path, link_bw=0, link_latency=0, cxl_bw=0, cxl_la
         except (ValueError, IndexError):
             continue
 
-        # Accumulate REMOTE/CXL data transfer time for the whole batch
+        is_kv = name.startswith('kv_load') or name.startswith('kv_evict')
+
         # Trace columns: name comp input_loc input_size weight_loc weight_size
         #                output_loc output_size comm_type comm_size misc
         if has_remote and len(cols) >= 8:
             for loc_idx, size_idx in [(2, 3), (4, 5), (6, 7)]:
                 try:
-                    total_comm_ns += _calc_transfer_ns(
-                        cols[loc_idx], int(cols[size_idx]),
-                        link_bw_bpns, link_latency, cxl_bw_bpns, cxl_latency)
+                    loc = cols[loc_idx]
+                    data_size = int(cols[size_idx])
+                    if data_size <= 0:
+                        continue
+                    if loc.startswith('REMOTE') and cpu_bw_bpns > 0:
+                        t = cpu_latency + int(data_size / cpu_bw_bpns)
+                        if is_kv:
+                            cpu_transfer_ns += t
+                        else:
+                            other_comm_ns += t
+                    elif loc.startswith('CXL') and cxl_bw_bpns > 0:
+                        t = cxl_latency + int(data_size / cxl_bw_bpns)
+                        if is_kv:
+                            cxl_transfer_ns += t
+                        else:
+                            other_comm_ns += t
                 except (ValueError, IndexError):
                     pass
 
-    # Exposed comm = comm time not overlapped with compute (batch-level)
-    exposed_comm = max(0, total_comm_ns - total_compute_ns)
-    return total_compute_ns + exposed_comm
+    # AstraSim model: kv_load/kv_evict/input_load run in parallel (MEM nodes),
+    # all must complete before first compute. Compute layers run sequentially.
+    pre_comp_comm = max(cpu_transfer_ns, cxl_transfer_ns, other_comm_ns)
+    return pre_comp_comm + total_compute_ns
 
 
-def compute_trace_cycles_mem(layers, link_bw=0, link_latency=0, cxl_bw=0, cxl_latency=0):
-    """In-memory version of compute_trace_cycles — no file I/O.
 
-    Takes the layer list returned by generate_trace_bypass() directly
-    instead of reading from a trace .txt file.
+def compute_trace_cycles_mem_detail(layers, cpu_bw=0, cpu_latency=0, cxl_bw=0, cxl_latency=0):
+    """In-memory version of compute_trace_cycles with breakdown dict.
 
-    Args:
-        layers: list[list[str]] — tokenised layer rows from generate_trace_bypass().
-        link_bw: inter-node link bandwidth in GB/s (0 = ignore REMOTE)
-        link_latency: per-access link latency in ns
-        cxl_bw: CXL device bandwidth in GB/s (0 = ignore CXL)
-        cxl_latency: per-access CXL latency in ns
+    Returns:
+        dict with keys:
+            total_ns:         total batch time (pre_comp_comm + compute)
+            compute_ns:       pure layer computation time (sequential)
+            cpu_transfer_ns:  kv_load/kv_evict via REMOTE (CPU→HBM)
+            cxl_transfer_ns:  kv_load/kv_evict via CXL (CXL→HBM)
+            comm_ns:          other (non-kv) remote/CXL transfer time
+            pre_comp_comm_ns: max(cpu, cxl, other) — blocking time before compute
     """
     if not layers:
-        return 0
+        return {'total_ns': 0, 'compute_ns': 0, 'cpu_transfer_ns': 0,
+                'cxl_transfer_ns': 0, 'comm_ns': 0, 'exposed_comm_ns': 0}
 
     total_compute_ns = 0
-    total_comm_ns = 0
-    link_bw_bpns = link_bw if link_bw > 0 else 0
+    cpu_transfer_ns = 0
+    cxl_transfer_ns = 0
+    other_comm_ns = 0
+    cpu_bw_bpns = cpu_bw if cpu_bw > 0 else 0
     cxl_bw_bpns = cxl_bw if cxl_bw > 0 else 0
-    has_remote = link_bw_bpns > 0 or cxl_bw_bpns > 0
+    has_remote = cpu_bw_bpns > 0 or cxl_bw_bpns > 0
 
     for cols in layers:
         if not cols or len(cols) < 2:
@@ -219,15 +279,48 @@ def compute_trace_cycles_mem(layers, link_bw=0, link_latency=0, cxl_bw=0, cxl_la
             continue
 
         total_compute_ns += comp_time
+        is_kv = name.startswith('kv_load') or name.startswith('kv_evict')
 
         if has_remote and len(cols) >= 8:
             for loc_idx, size_idx in ((2, 3), (4, 5), (6, 7)):
                 try:
-                    total_comm_ns += _calc_transfer_ns(
-                        cols[loc_idx], int(cols[size_idx]),
-                        link_bw_bpns, link_latency, cxl_bw_bpns, cxl_latency)
+                    loc = cols[loc_idx]
+                    data_size = int(cols[size_idx])
+                    if data_size <= 0:
+                        continue
+                    if loc.startswith('REMOTE') and cpu_bw_bpns > 0:
+                        t = cpu_latency + int(data_size / cpu_bw_bpns)
+                        if is_kv:
+                            cpu_transfer_ns += t
+                        else:
+                            other_comm_ns += t
+                    elif loc.startswith('CXL') and cxl_bw_bpns > 0:
+                        t = cxl_latency + int(data_size / cxl_bw_bpns)
+                        if is_kv:
+                            cxl_transfer_ns += t
+                        else:
+                            other_comm_ns += t
                 except (ValueError, IndexError):
                     pass
 
-    exposed_comm = max(0, total_comm_ns - total_compute_ns)
-    return total_compute_ns + exposed_comm
+    # AstraSim execution model (from llm_converter.py):
+    #   kv_evict ──┐
+    #   kv_load  ──┤  (parallel, independent MEM nodes)
+    #   input_load ┤
+    #              ↓
+    #        [embedding COMP] → [layernorm COMP] → [qkv COMP] → ...  (sequential)
+    #
+    # kv_load/kv_evict/input_load must ALL complete before first compute starts.
+    # They run in parallel with each other, so the blocking time is max() of them.
+    # Compute layers run sequentially after that.
+    pre_comp_comm = max(cpu_transfer_ns, cxl_transfer_ns, other_comm_ns)
+    total_ns = pre_comp_comm + total_compute_ns
+
+    return {
+        'total_ns': total_ns,
+        'compute_ns': total_compute_ns,
+        'cpu_transfer_ns': cpu_transfer_ns,
+        'cxl_transfer_ns': cxl_transfer_ns,
+        'comm_ns': other_comm_ns,
+        'pre_comp_comm_ns': pre_comp_comm,
+    }

@@ -14,7 +14,7 @@ class Device(Enum):
     CXL = 3
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0):
+    def __init__(self, model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, max_num_batched_tokens=2048):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -45,7 +45,6 @@ class MemoryModel():
 
         # Memory model
         self.weight = self.get_weight() # assume weight is loaded
-        self.npu_used = self.weight
         self.cpu_used = 0
 
         # Peak KV memory tracking (excludes model weight for NPU)
@@ -55,9 +54,35 @@ class MemoryModel():
         if self.weight > self.npu_mem:
             raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.npu_num//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.npu_num//GB_TO_BYTE}GB")
 
+        # Reserve activation memory for max_num_batched_tokens (vLLM/SGLang style)
+        # npu_used tracks weight + activation + KV; limit is simply npu_mem
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.activation_reserve = self._calc_activation_memory(max_num_batched_tokens)
+        self.npu_used = self.weight + self.activation_reserve
+
+        if self.npu_used > self.npu_mem:
+            raise RuntimeError(
+                f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: "
+                f"Model weight ({self.weight // MB_TO_BYTE}MB) + activation reserve "
+                f"({self.activation_reserve // MB_TO_BYTE}MB) = "
+                f"{self.npu_used // MB_TO_BYTE}MB exceeds "
+                f"total NPU memory {self.npu_mem // MB_TO_BYTE}MB. "
+                f"Reduce --max-num-batched-tokens or increase NPU memory."
+            )
+
+        self.mem_for_kv = self.npu_mem - self.npu_used
+
+        self.logger.info(
+            "NPU memory budget: total=%dMB, weight=%dMB, activation_reserve=%dMB (for %d tokens), kv_capacity=%dMB",
+            self.npu_mem // MB_TO_BYTE,
+            self.weight // MB_TO_BYTE,
+            self.activation_reserve // MB_TO_BYTE,
+            max_num_batched_tokens,
+            self.mem_for_kv // MB_TO_BYTE,
+        )
+
         if enable_prefix_caching:
             one_token_kv_size = self.get_kv(1)
-            self.mem_for_kv = self.npu_mem - self.weight
             self.npu_prefix_cache = RadixCache(device='NPU', 
                                                node_id=self.node_id,
                                                instance_id=self.instance_id,
@@ -80,10 +105,10 @@ class MemoryModel():
                     else:
                         raise RuntimeError(f"Device {prefix_storage} is currently not supported as a second tier prefix cache storage")
 
-                    self.second_tier_prefix_cache = RadixCache(device=device, 
+                    self.second_tier_prefix_cache = RadixCache(device=device,
                                                     node_id=self.node_id,
                                                     instance_id=self.instance_id,
-                                                    page_size=1,
+                                                    page_size=self.block_size,
                                                     capacity=prefix_cache_capacity,
                                                     kv_size=(one_token_kv_size * self.npu_num),
                                                     enable_kv_cache_events=True,
@@ -158,6 +183,30 @@ class MemoryModel():
 
         return weight
 
+    def _calc_activation_memory(self, max_num_batched_tokens):
+        """Calculate peak activation memory for max_num_batched_tokens.
+
+        Models the GPU/NPU memory needed for intermediate activations during
+        a single forward pass, following the vLLM/SGLang approach of reserving
+        this space so KV cache cannot starve batch processing.
+
+        Peak occurs at the FFN layer (SwiGLU) where gate_proj and up_proj
+        outputs coexist with the residual stream.
+        """
+        L = max_num_batched_tokens
+        tp = self.npus_per_group
+        config = self.config
+        ffn_dim = config.get("intermediate_size", config.get("ffn_dim", self.n_embd * 4))
+
+        # Peak during FFN (SwiGLU): residual + gate output + up output
+        ffn_peak = L * self.n_embd * self.fp + 2 * L * (ffn_dim // max(tp, 1)) * self.fp
+
+        # Peak during attention: residual + Q + K + V outputs
+        attn_peak = (L * self.n_embd * self.fp
+                     + L * (self.n_embd // max(tp, 1)) * self.fp
+                     + 2 * L * (self.kv_dim // max(tp, 1)) * self.fp)
+
+        return max(ffn_peak, attn_peak)
 
     def get_kv(self, seq):
         # shape of kv cache
@@ -201,19 +250,20 @@ class MemoryModel():
         evict_size += self.get_kv(num_blocks * self.block_size)
         return evict_size
 
-    def free_weight(self):
-        if self.npu_used - self.weight < 0:
+    def free_weight_activation(self):
+        fixed = self.weight + self.activation_reserve
+        if self.npu_used - fixed < 0:
             raise RuntimeError(
-                f"[MemoryModel] [node={self.node_id}, inst={self.instance_id}] NPU: tried to free model weight {self.weight / MB_TO_BYTE:.2f}MB "
+                f"[MemoryModel] [node={self.node_id}, inst={self.instance_id}] NPU: tried to free weight+activation {fixed / MB_TO_BYTE:.2f}MB "
                 f"but only {self.npu_used / MB_TO_BYTE:.2f}MB is used."
             )
         self.logger.info(
             "NPU: used: %.2fMB remove: %.2fMB after: %.2fMB",
             self.npu_used / MB_TO_BYTE,
-            self.weight / MB_TO_BYTE,
-            (self.npu_used - self.weight) / MB_TO_BYTE,
+            fixed / MB_TO_BYTE,
+            (self.npu_used - fixed) / MB_TO_BYTE,
         )
-        self.npu_used -= self.weight
+        self.npu_used -= fixed
 
     def is_free(self):
         return self.npu_used == 0 and self.cpu_used == 0
@@ -224,7 +274,9 @@ class MemoryModel():
         if device == Device.NPU:
             if self.npu_used + size > self.npu_mem:
                 raise RuntimeError(
-                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to load {size / MB_TO_BYTE:.2f}MB but only {(self.npu_mem - self.npu_used) / MB_TO_BYTE:.2f}MB is available."
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to load {size / MB_TO_BYTE:.2f}MB "
+                    f"but only {(self.npu_mem - self.npu_used) / MB_TO_BYTE:.2f}MB is available for KV cache "
+                    f"(activation_reserve={self.activation_reserve / MB_TO_BYTE:.2f}MB)."
                 )
             self.logger.info(
                 "NPU: used: %.2fMB load: %.2fMB after: %.2fMB",
@@ -233,7 +285,7 @@ class MemoryModel():
                 (self.npu_used + size) / MB_TO_BYTE,
             )
             self.npu_used += size
-            npu_kv = self.npu_used - self.weight
+            npu_kv = self.npu_used - self.weight - self.activation_reserve
             if npu_kv > self.peak_npu_kv:
                 self.peak_npu_kv = npu_kv
         elif device == Device.CPU:
@@ -267,7 +319,7 @@ class MemoryModel():
         if device == Device.NPU:
             if self.npu_used - size < self.weight:
                 raise RuntimeError(
-                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to free {size / MB_TO_BYTE:.2f}MB but only {(self.npu_used - self.weight) / MB_TO_BYTE:.2f}MB is used."
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to free {size / MB_TO_BYTE:.2f}MB but only {(self.npu_used - self.weight - self.activation_reserve) / MB_TO_BYTE:.2f}MB is used."
                 )
             self.logger.info(
                 "NPU: used: %.2fMB remove: %.2fMB after: %.2fMB",
@@ -303,7 +355,7 @@ class MemoryModel():
             if self.npu_mem - self.npu_used >= size:
                 return True
             else:
-                return False 
+                return False
         elif device == Device.CPU:
             if self.enable_prefix_sharing:
                 return self.second_tier_prefix_cache.is_avail(size)

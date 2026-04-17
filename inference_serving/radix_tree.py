@@ -30,9 +30,6 @@ try:
 except ImportError:
     msgspec = None
 from .logger import get_logger
-import logging
-
-_rtlog = logging.getLogger("radix_tree.perf")
 
 GB_TO_BYTE = 1024 * 1024 * 1024
 MB_TO_BYTE = 1024 * 1024
@@ -382,7 +379,18 @@ class RadixCache():
 
     def total_size(self):
         # total size refers to the size of the entire cache, including both evictable and protected cache
-        return self._total_size_helper() # token count not Byte size
+        return self.evictable_size_ + self.protected_size_
+
+    def verify_total_size(self):
+        """Periodic sanity check: compare cached total_size with BFS traversal."""
+        bfs = self._total_size_helper()
+        cached = self.evictable_size_ + self.protected_size_
+        if bfs != cached:
+            print(f"[TOTAL_SIZE_VERIFY] device={self.device} MISMATCH bfs={bfs} cached={cached} "
+                  f"evict={self.evictable_size_} prot={self.protected_size_}")
+        else:
+            print(f"[TOTAL_SIZE_VERIFY] device={self.device} OK total={cached}")
+        return bfs == cached
 
     def _total_size_helper(self):
         total_size = 0
@@ -397,7 +405,7 @@ class RadixCache():
 
     def _match_prefix_helper(self, node: TreeNode, key: List) -> tuple[int, TreeNode]:
         node.last_access_time = time.monotonic()
-
+        
         if len(key) == 0:
             return 0, node
 

@@ -6,9 +6,9 @@ Runs the same simulation twice with the same JSONL trace and compares:
 """
 import subprocess, sys, time, csv, os
 
-DATASET   = "dataset/example_trace.jsonl"
+DATASET   = "dataset/sharegpt_req300_rate10_llama.jsonl"
 CLUSTER   = "cluster_config/single_node_single_instance.json"
-NUM_REQ   = 100
+NUM_REQ   = 300
 FP        = 16
 BLOCK_SZ  = 16
 LOG_INT   = 1.0

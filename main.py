@@ -99,19 +99,22 @@ def main():
     bypass_use_file = args.bypass_use_file
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading)
-    # Read link/CXL bw/latency for bypass mode transfer calculation
+    # Read per-memory bw/latency for bypass mode transfer calculation
     if bypass_astrasim:
         _cc_path = f'../{args.cluster_config}' if not os.path.isabs(args.cluster_config) else args.cluster_config
         with open(_cc_path, 'r') as _f:
             _cc = json.load(_f)
-        _link_bw = _cc.get("link_bw", 0)
-        _link_latency = _cc.get("link_latency", 0)
+        # CPU memory (REMOTE:N in trace)
+        _cpu_cfg = _cc.get("nodes", [{}])[0].get("cpu_mem", {})
+        _cpu_bw = _cpu_cfg.get("mem_bw", 0)
+        _cpu_latency = _cpu_cfg.get("mem_latency", 0)
+        # CXL memory (CXL in trace)
         _cxl_cfg = _cc.get("cxl_mem", {})
         _cxl_bw = _cxl_cfg.get("mem_bw", 0)
         _cxl_latency = _cxl_cfg.get("mem_latency", 0)
     else:
-        _link_bw = 0
-        _link_latency = 0
+        _cpu_bw = 0
+        _cpu_latency = 0
         _cxl_bw = 0
         _cxl_latency = 0
     num_nodes = cluster["num_nodes"]
@@ -261,11 +264,18 @@ def main():
     last_log = 0    # last logged time
     FREQ = 1000_000_000 # 1 GHz (1e9 Hz)
     INTERVAL = log_interval*FREQ
-    RATIO = FREQ//INTERVAL
+    RATIO = FREQ / INTERVAL  # tokens-per-interval → tokens-per-second conversion factor
     total_prompt = 0
     total_gen = 0
     total_latency = 0
     req_cnt = 0
+
+    # Per-interval & cumulative batch timing breakdown (bypass mode)
+    # Each group: compute, cpu_xfer, cxl_xfer, total, batch_count, token_count
+    _iv_pf = [0,0,0,0,0,0];  _cu_pf = [0,0,0,0,0,0]   # prefill
+    _iv_dc = [0,0,0,0,0,0];  _cu_dc = [0,0,0,0,0,0]   # decode
+    # indices: 0=compute 1=cpu 2=cxl 3=total 4=batches 5=tokens
+
 
     # Set Event Handler that loop with INTERVAL time until first request arrive (for all instances)
     first_arival_time = schedulers[0].get_first_arrival_time()
@@ -354,14 +364,27 @@ def main():
                                        expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id], enable_attn_prediction,
                                        enable_sub_batch_interleaving, fp)
                         trace_path = f"inputs/trace/{instance['hardware']}/{new_req.model}/instance{instance_id}_batch{new_req.batch_id}.txt"
-                        batch_cycles_ns = compute_trace_cycles(trace_path, _link_bw, _link_latency, _cxl_bw, _cxl_latency)
+                        batch_cycles_ns = compute_trace_cycles(trace_path, _cpu_bw, _cpu_latency, _cxl_bw, _cxl_latency)
                     else:
                         # In-memory bypass path (default, faster — no final file rewrite/reread)
                         layers = generate_trace_bypass(new_req, instance["hardware"], instance["npu_num"], instance["npu_group"], instance["pd_type"],
                                        node_id, instance_id, max_num_batched_tokens, placement[instance_id], block_mode_on[instance_id],
                                        expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id], enable_attn_prediction,
                                        enable_sub_batch_interleaving, fp)
-                        batch_cycles_ns = compute_trace_cycles_mem(layers, _link_bw, _link_latency, _cxl_bw, _cxl_latency)
+                        _detail = compute_trace_cycles_mem_detail(layers, _cpu_bw, _cpu_latency, _cxl_bw, _cxl_latency)
+                        batch_cycles_ns = _detail['total_ns']
+                        # Accumulate per prefill/decode
+                        _d = [_detail['compute_ns'], _detail['cpu_transfer_ns'], _detail['cxl_transfer_ns'], _detail['total_ns']]
+                        if new_req.num_prefill > 0:
+                            for _acc in (_iv_pf, _cu_pf):
+                                for j in range(4): _acc[j] += _d[j]
+                                _acc[4] += 1
+                                _acc[5] += new_req.total_len - new_req.num_decode
+                        else:
+                            for _acc in (_iv_dc, _cu_dc):
+                                for j in range(4): _acc[j] += _d[j]
+                                _acc[4] += 1
+                                _acc[5] += new_req.num_decode
                     finish_time = current + batch_cycles_ns
                     controller.submit_event(finish_time, sys)
                 else:
@@ -387,7 +410,8 @@ def main():
             print(
                     log_time_str,
                     blue(f"Avg prompt throughput: {prompt_th * RATIO:.1f} tokens/s,"),
-                    blue(f"Avg generation throughput: {gen_th * RATIO:.1f} tokens/s"),
+                    blue(f"Avg generation throughput: {gen_th * RATIO:.1f} tokens/s,"),
+                    blue(f"Finished/Total reqs: {req_cnt}/{num_req}"),
                     end="\n"
                 )
             prompt_th = 0
@@ -396,15 +420,16 @@ def main():
             ######### Per Instance Metrics #########
 
             for inst_id in range(num_instances):
-                running_reqs = sum([len(batch.requests) for batch in schedulers[inst_id].inflight] + [len([req for req in schedulers[inst_id].request if req.arrival <= current])])
-                
+                inflight_reqs = sum(len(batch.requests) for batch in schedulers[inst_id].inflight)
+                waiting_reqs = len([req for req in schedulers[inst_id].request if req.arrival <= current])
+
                 mem = schedulers[inst_id].memory
-                npu_used_mb = mem.npu_used / MB_TO_BYTE
-                npu_cap_mb = mem.npu_mem / MB_TO_BYTE if mem.npu_mem else 0.0
-                npu_util = (mem.npu_used / mem.npu_mem * 100.0) if mem.npu_mem else 0.0
-            
-                print(f"{log_indent+tree_indent}Running Instance[{inst_id}]: {running_reqs} reqs,", end=' ')
-                print(f"Total # {schedulers[inst_id].npu_num} NPUs, Each NPU Memory Usage {npu_used_mb:.2f} MB ({npu_util:.3f} % Used)", end='')
+                npu_kv_used = mem.npu_used - mem.weight - mem.activation_reserve
+                npu_kv_cap = mem.npu_mem - mem.weight - mem.activation_reserve
+                npu_kv_util = (npu_kv_used / npu_kv_cap * 100.0) if npu_kv_cap > 0 else 0.0
+
+                print(f"{log_indent+tree_indent}Running Instance[{inst_id}]: inflight {inflight_reqs} reqs, waiting {waiting_reqs} reqs,", end=' ')
+                print(f"Total # {schedulers[inst_id].npu_num} NPUs, KV Cache {npu_kv_used / MB_TO_BYTE:.2f} / {npu_kv_cap / MB_TO_BYTE:.2f} MB ({npu_kv_util:.3f} %)", end='')
                 if enable_prefix_caching:
                     npu_cache = schedulers[inst_id].memory.npu_prefix_cache
                     npu_req, npu_hit = npu_cache.return_prefix_info()
@@ -418,7 +443,7 @@ def main():
                 for i, (node_id, inst_ids) in enumerate(node2inst_mapping.items()):
                     node_cpu_usage = 0
                     if enable_prefix_sharing and prefix_storage == "CPU":
-                        node_cpu_usage = (prefix_pools[node_id].total_size() * 131072)
+                        node_cpu_usage = prefix_pools[node_id].total_memory_usage()
                     else:
                         inst_usage = []
                         for inst_id in inst_ids:
@@ -461,8 +486,8 @@ def main():
                 if enable_prefix_sharing:
                     num_prefix_pool = len(prefix_pools)
                     for i, cxl_id, cxl_pool in enumerate(prefix_pools):
-                        cxl_usage = (cxl_pool.total_size() * 131072)
-                        cxl_util = cxl_usage / cxl_pool.capacity
+                        cxl_usage = cxl_pool.total_memory_usage()
+                        cxl_util = (cxl_usage / cxl_pool.capacity) * 100
                         if not power_modeling and i == num_prefix_pool - 1:
                             tree_indent = '└─'
                         cxl_req, cxl_hit = cxl_pool.return_prefix_info()
@@ -472,8 +497,8 @@ def main():
                     # else only one instance could explictly use CXL
                     inst_id = 0
                     cxl_cache = schedulers[inst_id].memory.second_tier_prefix_cache
-                    cxl_usage = (cxl_cache.total_size() * 131072)
-                    cxl_util = cxl_usage / cxl_cache.capacity
+                    cxl_usage = cxl_cache.total_memory_usage()
+                    cxl_util = (cxl_usage / cxl_cache.capacity) * 100
                     cxl_req, cxl_hit = cxl_cache.return_prefix_info()
                     cxl_hit_str = f", CXL Hit {cxl_hit/cxl_req*100:.2f}% ({cxl_hit}/{cxl_req})" if cxl_req > 0 else ""
                     if not power_modeling:
@@ -483,6 +508,25 @@ def main():
             if power_modeling:
                 tree_indent = '└─'
                 print(f"{log_indent+tree_indent}Avg power consumption: {power_model.get_current_power(current)} W")
+
+            # Periodic radix tree integrity check (every 100th of sim time)
+            if enable_prefix_caching and int(last_log / FREQ) % 100 == 0:
+                for inst_id in range(num_instances):
+                    schedulers[inst_id].memory.npu_prefix_cache.verify_total_size()
+                    if hasattr(schedulers[inst_id].memory, 'second_tier_prefix_cache'):
+                        schedulers[inst_id].memory.second_tier_prefix_cache.verify_total_size()
+
+            # Bypass batch timing breakdown (interval + cumulative)
+            if bypass_astrasim and not bypass_use_file:
+                NS_TO_MS = 1e-6
+                iv_pf_ms = _iv_pf[3] * NS_TO_MS; iv_dc_ms = _iv_dc[3] * NS_TO_MS
+                cu_pf_ms = _cu_pf[3] * NS_TO_MS; cu_dc_ms = _cu_dc[3] * NS_TO_MS
+                print(f"{log_indent}[Interval] Prefill/Decode time: {iv_pf_ms:.2f}/{iv_dc_ms:.2f} ms")
+                print(f"{log_indent}[Total]    Prefill/Decode time: {cu_pf_ms:.2f}/{cu_dc_ms:.2f} ms")
+
+                # Reset interval counters
+                _iv_pf = [0,0,0,0,0,0]
+                _iv_dc = [0,0,0,0,0,0]
 
         # check if all requests are done for current instance
         if (instance_id not in decode_instance or is_prefill_done) and instance_id not in done_instance and schedulers[instance_id].is_request_empty():
@@ -500,7 +544,7 @@ def main():
             if len(done_instance) == num_instances:
                 for inst_idx in range(num_instances):
                     schedulers[inst_idx].memory.free_prefix_cache()
-                    schedulers[inst_idx].memory.free_weight()
+                    schedulers[inst_idx].memory.free_weight_activation()
                 
                     if not schedulers[inst_idx].memory.is_free():
                         logger.error(f"Instance[{inst_idx}] has unfreed memory after all requests are done")
@@ -517,7 +561,7 @@ def main():
             if bypass_astrasim:
                 # No batch scheduled — add a timer event to advance time
                 # to the next request arrival or log interval
-                if not controller.events:
+                if not controller.has_event_for_npu(sys):
                     next_arrival = schedulers[instance_id].get_next_arrival_time(current)
                     if next_arrival is not None:
                         controller.submit_event(next_arrival, sys)
