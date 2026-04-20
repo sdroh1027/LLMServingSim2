@@ -262,9 +262,11 @@ class Scheduler:
             # Cap batch_len so that batched initial reqs does not overly consume KV capacity
             _kv_budget = self.memory.mem_for_kv
             _kv_accum = 0
+            _batched_tokens = 0
             for i in range(batch_len):
                 _kv_accum += self.memory.get_kv(batch_req[i].input)
-                if _kv_accum > _kv_budget:
+                _batched_tokens += batch_req[i].input
+                if _kv_accum > _kv_budget or _batched_tokens > self.max_num_batched_tokens:
                     batch_len = max(i, 1)
                     batch_req = batch_req[:batch_len]
                     break
