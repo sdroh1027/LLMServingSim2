@@ -164,6 +164,73 @@ for i in range(batch.num_prefill):
 |---|---|---|
 | Lookup | `(1536, chunk)` once | `(512, 512)` + `(1024, 256)` each, then sum |
 
+### 14. Shared prefix pool — `kv_size`와 `page_size` 하드코딩
+
+> Fix date: 2026-04-28
+
+**File**: `main.py` — `enable_prefix_caching && enable_prefix_sharing` 분기의 shared prefix pool 생성부 (CPU/CXL)
+
+**증상**: `--enable-prefix-sharing` 옵션을 켰을 때, 공유 `RadixCache`가 하드코딩된 값으로 만들어지고 있었음:
+
+| Pool | `page_size` | `kv_size` |
+|---|---|---|
+| CPU 공유 pool | `256` | `131072` |
+| CXL 공유 pool | `1` | `131072` |
+
+이 값에 두 가지 문제가 있음:
+
+1. **`kv_size`가 Llama-3.1-8B 전용 값**. `2 * kv_dim * n_layer * fp_bytes = 2 * 1024 * 32 * 2 = 131072`는 정확히 그 모델 한 개에서만 성립. 다른 모델에서는 `total_memory_usage()`가 틀려져서 capacity 회계(`is_avail`, `evict_prefix_cache`, util 로그)가 전부 어긋남.
+2. **`page_size`가 `block_size`와 불일치**. 로컬 NPU prefix cache는 `page_size=block_size`(기본 16) 인데, 공유 pool은 NPU와 다른 단위로 prefix를 청크하므로 같은 토큰 시퀀스에 대해 매칭 결과가 일관되지 않음.
+
+비공유 경로(`MemoryModel.__init__`)는 이미 올바르게 처리되고 있음: `page_size=self.block_size`, `kv_size=get_kv(1) * npu_num`. 공유 경로(`main.py`)만 그 규칙에서 벗어나 있었음.
+
+**원인**: 초기 스캐폴딩에서 들어간 상수가 모델 config와 CLI 인자에서 다시 계산되도록 갱신되지 않음.
+
+**수정**: 두 값을 모두 cluster config / CLI 인자에서 유도하도록 변경:
+
+- `page_size=block_size` — CLI `--block-size`와 동일, 인스턴스별 NPU/CPU/CXL cache와도 동일.
+- `kv_size = 2 * kv_dim * n_layer * (fp // 8)` — 한 인스턴스의 전체 NPU에 걸친 토큰당 KV 바이트. 공유 pool은 NPU별 shard가 아니라 전체 텐서를 저장하므로 `npu_num`에 독립적. `_shared_pool_kv_size(model_name)`로 구현하여 `get_config`로 모델 config를 읽어 계산.
+- `_check_same_model()` 가드 추가: 한 pool을 공유하는 인스턴스들은 같은 `model_name`을 써야 함. CPU pool은 노드 단위(`node2inst_mapping[node_id]`), CXL pool은 전역(모든 인스턴스).
+- 부가 수정: CPU 분기의 `node_id=0`도 multi-node에서 잘못된 값이라 `node_id=i`로 정정 — 로그에서 노드 번호가 올바르게 찍히도록.
+
+**예시 (Llama-3.1-8B, fp=16, block_size=16)**:
+
+| | Before | After |
+|---|---|---|
+| `kv_size` (CPU/CXL 공유) | `131072` (상수) | `2 * 1024 * 32 * 2 = 131072` (이 모델에서만 우연히 일치) |
+| `page_size` (CPU 공유) | `256` | `16` |
+| `page_size` (CXL 공유) | `1` | `16` |
+
+Llama-3.1-8B가 아닌 모델에서는 `kv_size` 값이 달라짐 (예: Llama-3.1-70B → `2 * 1024 * 80 * 2 = 327680`).
+
+### 11. CXL per-pool logging unpack error
+
+> Date: 2026-04-21
+
+**File**: `main.py` line 488
+
+**Symptom**: Runtime crash during logging when `--prefix-storage CXL --enable-prefix-sharing`:
+```
+ValueError: not enough values to unpack (expected 3, got 2)
+  File "main.py", line 488, in main
+    for i, cxl_id, cxl_pool in enumerate(prefix_pools):
+```
+
+**Cause**: `prefix_pools` is a flat list of `RadixCache` objects (see lines 177–203), so `enumerate()` yields `(index, pool)` — only 2 values. The loop tried to unpack 3.
+
+**Fix**: Use `i` directly as the CXL pool id.
+```python
+# before
+for i, cxl_id, cxl_pool in enumerate(prefix_pools):
+    ...
+    print(f"... CXL[{cxl_id}]: ...")
+
+# after
+for i, cxl_pool in enumerate(prefix_pools):
+    ...
+    print(f"... CXL[{i}]: ...")
+```
+
 ## Unfixed (Known Issues)
 
 ### 1. `lock_prefix` timing for init (runs before feasibility check)

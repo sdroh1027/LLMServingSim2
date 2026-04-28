@@ -175,15 +175,40 @@ def main():
         num_prefix_pool = num_nodes
         # make prefix pool objects based on num_prefix_pool
         prefix_pools = []
+
+        # bytes-per-token for the shared prefix pool. Mirrors MemoryModel.get_kv(1) * npu_num
+        # (= total KV across all NPUs of an instance), which is npu_num-independent and equals
+        # 2 * kv_dim * n_layer * fp_bytes. Instances sharing a pool must use the same model.
+        def _shared_pool_kv_size(model_name):
+            cfg = get_config(model_name)
+            n_embd = cfg['hidden_size']
+            n_head = cfg['num_attention_heads']
+            head_dim = cfg.get('head_dim', n_embd // n_head)
+            kv_head = cfg.get('num_key_value_heads', n_head)
+            kv_dim = kv_head * head_dim
+            n_layer = cfg['num_hidden_layers']
+            fp_bytes = fp // 8
+            return 2 * kv_dim * n_layer * fp_bytes
+
+        def _check_same_model(inst_ids, scope):
+            models = {instances[iid]["model_name"] for iid in inst_ids}
+            if len(models) > 1:
+                raise RuntimeError(
+                    f"Shared prefix pool ({scope}) requires all instances to use the same model, "
+                    f"but found: {sorted(models)}"
+                )
+            return next(iter(models))
+
         if prefix_storage == 'CPU':
             for i in range(num_prefix_pool):
                 if cpu_mem_size[i] > 0:
+                    pool_model = _check_same_model(node2inst_mapping[i], f"CPU node={i}")
                     new_prefix_pool = RadixCache(
-                                                node_id=0,
-                                                device=prefix_storage, 
-                                                page_size=256,
+                                                node_id=i,
+                                                device=prefix_storage,
+                                                page_size=block_size,
                                                 capacity = cpu_mem_size[i] * GB_TO_BYTE,
-                                                kv_size=131072,
+                                                kv_size=_shared_pool_kv_size(pool_model),
                                                 enable_kv_cache_events=True)
                     prefix_pools.append(new_prefix_pool)
                 else:
@@ -193,12 +218,13 @@ def main():
 
         elif prefix_storage == 'CXL':
             if cluster["cxl_mem_size"] > 0:
+                pool_model = _check_same_model(list(range(num_instances)), "CXL")
                 new_prefix_pool = RadixCache(
                                             node_id=None,
-                                            device=prefix_storage, 
-                                            page_size=1,
-                                            capacity = cluster["cxl_mem_size"] * GB_TO_BYTE, 
-                                            kv_size=131072,
+                                            device=prefix_storage,
+                                            page_size=block_size,
+                                            capacity = cluster["cxl_mem_size"] * GB_TO_BYTE,
+                                            kv_size=_shared_pool_kv_size(pool_model),
                                             enable_kv_cache_events=True)
                 prefix_pools.append(new_prefix_pool)
                 # This means every instance shares the same universal prefix pool (maybe fixed later)
@@ -485,14 +511,14 @@ def main():
             if prefix_storage == "CXL":
                 if enable_prefix_sharing:
                     num_prefix_pool = len(prefix_pools)
-                    for i, cxl_id, cxl_pool in enumerate(prefix_pools):
+                    for i, cxl_pool in enumerate(prefix_pools):
                         cxl_usage = cxl_pool.total_memory_usage()
                         cxl_util = (cxl_usage / cxl_pool.capacity) * 100
                         if not power_modeling and i == num_prefix_pool - 1:
                             tree_indent = '└─'
                         cxl_req, cxl_hit = cxl_pool.return_prefix_info()
                         cxl_hit_str = f", CXL Hit {cxl_hit/cxl_req*100:.2f}% ({cxl_hit}/{cxl_req})" if cxl_req > 0 else ""
-                        print(f"{log_indent+tree_indent}CXL[{cxl_id}]: Total CXL Device Memory Usage {cxl_usage/MB_TO_BYTE:.2f}MB, {cxl_util:.3f} % Used{cxl_hit_str}")
+                        print(f"{log_indent+tree_indent}CXL[{i}]: Total CXL Device Memory Usage {cxl_usage/MB_TO_BYTE:.2f}MB, {cxl_util:.3f} % Used{cxl_hit_str}")
                 else:
                     # else only one instance could explictly use CXL
                     inst_id = 0
