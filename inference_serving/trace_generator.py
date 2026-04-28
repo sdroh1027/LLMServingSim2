@@ -249,7 +249,7 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
     npus_per_group = npu_num // npu_group
 
     if not enable_attn_prediction:
-        res = _load_attn_perf_db_dict(hardware, model, npus_per_group)
+        res = _load_attn_perf_db_dict(hardware, model, npus_per_group) # [sidong] TODO: this IO also can be optimized by caching the perf db dict in memory, similar to _perf_db_cache
         prefill_perf_db = res["prefill"]
         decode_perf_db = res["decode"]
 

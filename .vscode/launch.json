@@ -1,0 +1,26 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "LVEval hotpot 16k qwen3-32b rate10 rep5 (CXL)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--cluster-config", "cluster_config/single_node_h100_qwen3-32b_cxl2560.json",
+                "--dataset", "dataset/lveval_hotpotwikiqa_mixup_16k_qwen3-32b_rate10.0_rep5.jsonl",
+                "--num-req", "620",
+                "--bypass-astrasim",
+                "--enable-prefix-caching",
+                "--prefix-storage", "CXL",
+                "--output", "output/lveval_hotpot_16k_qwen3-32b_rate10.0_rep5_cxl",
+                "--max-num-batched-tokens", "42400",
+                "--log-interval", "2.0",
+                "--log-level", "INFO"
+            ]
+        }
+    ]
+}

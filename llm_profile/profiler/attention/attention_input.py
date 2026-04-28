@@ -20,7 +20,7 @@ class AttentionInput:
                 return False
             elif self.prefill_chunk_size == 0:
                 return False
-            elif self.prefill_chunk_size + self.kv_cache_size > max_seq_len:
+            elif self.kv_cache_size + 1 > max_seq_len:  # self.kv_cache_size includes both # tokens for kv cache hits & should be generated
                 return False
             elif self.kv_cache_size == 0:
                 return False

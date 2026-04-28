@@ -47,11 +47,12 @@ def get_attention_prefill_chunk_sizes_to_profile(max_seq_len: int):
     # PREFILL_CHUNK_SIZE_SPACE = [64, 128, 256, 512, 768, 1024, 1536, 2048, 3076, 4096, 8192, 16384]
     # PREFILL_CHUNK_SIZE_SPACE = range(128, 128 * 1024, 128)
     PREFILL_CHUNK_SIZE_SPACE = (
-        list(range(32, 128 + 1, 32))
-        + list(range(128, 1024 + 1, 32))
-        + list(range(1024, 4 * 1024 + 1, 64))
-        + list(range(4 * 1024, 16 * 1024 + 1, 128))
-        + list(range(16 * 1024, 64 * 1024 + 1, 256))
+        list(range(32, 128, 32))
+        + list(range(128, 1024, 64))
+        + list(range(1  * 1024, 4  * 1024, 128))
+        + list(range(4  * 1024, 16 * 1024, 256))
+        + list(range(16 * 1024, 32 * 1024, 512))
+        + list(range(32 * 1024, 64 * 1024 + 1, 1024))
     )
     prefill_chunk_sizes_to_profile = []
     for prefill_chunk_size in PREFILL_CHUNK_SIZE_SPACE:
@@ -90,6 +91,16 @@ def get_attention_input_combinations(
     prefill_chunk_sizes_to_profile = get_attention_prefill_chunk_sizes_to_profile(
         max_seq_len
     )
+
+    input_combinations = []
+    for prefill_chunk_size in prefill_chunk_sizes_to_profile:
+        kv_cache_sizes_to_profile = [
+            kv_cache_size for kv_cache_size in prefill_chunk_sizes_to_profile if kv_cache_size >= prefill_chunk_size
+        ]
+        input_combinations.extend(
+            product([prefill_chunk_size], kv_cache_sizes_to_profile, [1], [True])
+        )
+    '''
     for prefill_chunk_size in prefill_chunk_sizes_to_profile:
         num_partitions = max_seq_len // prefill_chunk_size
         kv_cache_sizes_to_profile = [
@@ -99,16 +110,24 @@ def get_attention_input_combinations(
         input_combinations.extend(
             product([prefill_chunk_size], kv_cache_sizes_to_profile, [1], [True])
         )
+    
     # Full prefills
     prefill_lengths_to_profile = get_seq_lengths_to_profile(max_seq_len)
-    input_combinations.extend(product(prefill_lengths_to_profile, [0], [1], [True]))
+    input_combinations.extend(product(prefill_lengths_to_profile, [0], [1], [True])) # [sidong] not used in profiling
+    '''
     # Decodes
     kv_cache_sizes_to_profile = get_seq_lengths_to_profile(max_model_len)
     batch_sizes_to_profile = get_attention_batch_sizes_to_profile(
         min_batch_size, max_batch_size
     )
     input_combinations.extend(
-        product([0], kv_cache_sizes_to_profile, batch_sizes_to_profile, [False])
+        (
+            (0, kv_cache_size, batch_size, False)
+            for kv_cache_size, batch_size in product(
+                kv_cache_sizes_to_profile, batch_sizes_to_profile
+            )
+            if kv_cache_size * batch_size <= max_seq_len
+        )
     )
 
     valid_input_combinations = []
@@ -152,7 +171,9 @@ def get_max_num_blocks(
         2
         * block_size
         * (getattr(model_config, "num_key_value_heads", getattr(model_config, "num_attention_heads", 32)) // tensor_parallel_size)
-        * (getattr(model_config, "hidden_size", 4096) // getattr(model_config, "num_attention_heads", 32))
+        * getattr(model_config, "head_dim",
+            getattr(model_config, "hidden_size", 4096) // getattr(model_config, "num_attention_heads", 32),
+        )
         * element_size
     )
     assert getattr(model_config, "num_hidden_layers", 32) % max_pipeline_parallel_size == 0
