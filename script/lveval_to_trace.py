@@ -90,7 +90,8 @@ def convert(input_path: str, output_path: str, tokenizer_name: str, tokenizer,
     meta = {
         "tokenizer_model": tokenizer_name,
         "source_dataset": str(input_path),
-        "num_req": num_req,
+        "num_req_arg": num_req,
+        "num_req": len(raw_rows),
         "repeat": repeat,
         "random_repeat": random_repeat,
         "total_req": len(rows),
@@ -149,10 +150,10 @@ def convert(input_path: str, output_path: str, tokenizer_name: str, tokenizer,
 
 def main():
     parser = argparse.ArgumentParser(description="LVEval -> LLMServingSim2 trace converter")
-    parser.add_argument("--input",        required=True,  help="LVEval JSONL 파일 경로")
-    parser.add_argument("--output",       required=True,  help="출력 JSONL 파일 경로")
+    parser.add_argument("--input-path",        required=True,  help="LVEval JSONL 파일 경로")
+    parser.add_argument("--output-path",       required=True,  help="출력 JSONL 파일 경로")
     parser.add_argument("--model",        default="gpt2", help="HuggingFace 토크나이저 모델명 (default: gpt2)")
-    parser.add_argument("--num-req",      type=int, default=200, help="변환할 최대 요청 수 (default: 200)")
+    parser.add_argument("--num-req-parsed",      type=int, default=200, help="변환할 최대 요청 수 (default: 200)")
     parser.add_argument("--arrival-rate", type=float, default=1.0,
                         help="포아송 도착률 req/sec (default: 1.0)")
     parser.add_argument("--seed",         type=int, default=42, help="랜덤 시드")
@@ -162,7 +163,7 @@ def main():
     args = parser.parse_args()
 
     tokenizer_name, tokenizer = load_tokenizer(args.model)
-    convert(args.input, args.output, tokenizer_name, tokenizer, args.num_req, args.arrival_rate, args.seed, args.repeat, args.random_repeat)
+    convert(args.input_path, args.output_path, tokenizer_name, tokenizer, args.num_req_parsed, args.arrival_rate, args.seed, args.repeat, args.random_repeat)
 
 
 if __name__ == "__main__":

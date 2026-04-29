@@ -13,11 +13,12 @@ set -e
 MODEL="Qwen/Qwen3-32B"
 MODEL_TAG="qwen3-32b"
 NUM_REQ=9999   # 각 데이터셋 전체 항목 사용 (실제 항목 수가 상한)
-RATE=1.0
+RATE=10.0
 SEED=42
+REPEAT=5
 
-DATASETS=(hotpotwikiqa_mixup multifieldqa_en_mixup loogle_SD_mixup factrecall_en)
-LENGTHS=(16k 32k 64k 128k 256k)
+DATASETS=(hotpotwikiqa_mixup multifieldqa_en_mixup loogle_SD_mixup factrecall_en) # (hotpotwikiqa_mixup multifieldqa_en_mixup loogle_SD_mixup factrecall_en)
+LENGTHS=(16k) # (16k 32k 64k 128k 256k) 까지 존재
 
 TOTAL=$(( ${#DATASETS[@]} * ${#LENGTHS[@]} ))
 DONE=0
@@ -26,7 +27,7 @@ for DATASET in "${DATASETS[@]}"; do
   for LEN in "${LENGTHS[@]}"; do
     DONE=$(( DONE + 1 ))
     INPUT="../LVEval/data/${DATASET}/${DATASET}_${LEN}.jsonl"
-    OUTPUT="dataset/lveval_${DATASET}_${LEN}_${MODEL_TAG}_rate${RATE}.jsonl"
+    OUTPUT="dataset/lveval_${DATASET}_${LEN}_${MODEL_TAG}_rate${RATE}_rep${REPEAT}.jsonl"
 
     echo "=========================================="
     echo "[${DONE}/${TOTAL}] ${DATASET} / ${LEN}"
@@ -40,7 +41,8 @@ for DATASET in "${DATASETS[@]}"; do
       --model        "$MODEL" \
       --num-req      "$NUM_REQ" \
       --arrival-rate "$RATE" \
-      --seed         "$SEED"
+      --seed         "$SEED" \
+      --repeat       "$REPEAT"
   done
 done
 

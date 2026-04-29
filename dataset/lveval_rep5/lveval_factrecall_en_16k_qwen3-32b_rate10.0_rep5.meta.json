@@ -1,0 +1,11 @@
+{
+  "tokenizer_model": "Qwen/Qwen3-32B",
+  "source_dataset": "../LVEval/data/factrecall_en/factrecall_en_16k.jsonl",
+  "num_req_arg": 9999,
+  "num_req": 200,
+  "repeat": 5,
+  "random_repeat": false,
+  "total_req": 1000,
+  "arrival_rate_req_per_sec": 10.0,
+  "seed": 42
+}
