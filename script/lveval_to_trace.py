@@ -84,23 +84,10 @@ def convert(input_path: str, output_path: str, tokenizer_name: str, tokenizer,
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     written = 0
+    sum_in = 0
+    sum_out = 0
 
-    # 메타데이터를 별도 파일로 저장 (JSONL 파일과 같은 이름, .meta.json 확장자)
     meta_path = str(output_path).replace(".jsonl", "") + ".meta.json"
-    meta = {
-        "tokenizer_model": tokenizer_name,
-        "source_dataset": str(input_path),
-        "num_req_arg": num_req,
-        "num_req": len(raw_rows),
-        "repeat": repeat,
-        "random_repeat": random_repeat,
-        "total_req": len(rows),
-        "arrival_rate_req_per_sec": arrival_rate,
-        "seed": seed,
-    }
-    with open(meta_path, "w", encoding="utf-8") as mf:
-        json.dump(meta, mf, indent=2, ensure_ascii=False)
-    print(f"[meta]    Saved metadata -> {meta_path}")
 
     with open(output_path, "w", encoding="utf-8") as fout:
         for i, (row, arrival_ns) in enumerate(zip(rows, arrival_times)):
@@ -133,15 +120,34 @@ def convert(input_path: str, output_path: str, tokenizer_name: str, tokenizer,
             }
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
             written += 1
+            sum_in  += len(input_ids)
+            sum_out += len(output_ids)
 
             if (i + 1) % 20 == 0:
                 print(f"  {i+1}/{len(rows)} done...", flush=True)
 
     print(f"[convert] Done. {written} records -> {output_path}")
 
-    records = [json.loads(l) for l in open(output_path, encoding="utf-8")]
-    avg_in  = sum(r["input_toks"]  for r in records) / len(records)
-    avg_out = sum(r["output_toks"] for r in records) / len(records)
+    avg_in  = sum_in  / written if written else 0.0
+    avg_out = sum_out / written if written else 0.0
+
+    meta = {
+        "tokenizer_model": tokenizer_name,
+        "source_dataset": str(input_path),
+        "num_req_arg": num_req,
+        "num_req": len(raw_rows),
+        "repeat": repeat,
+        "random_repeat": random_repeat,
+        "total_req": len(rows),
+        "arrival_rate_req_per_sec": arrival_rate,
+        "seed": seed,
+        "avg_input_toks": round(avg_in, 1),
+        "avg_output_toks": round(avg_out, 1),
+    }
+    with open(meta_path, "w", encoding="utf-8") as mf:
+        json.dump(meta, mf, indent=2, ensure_ascii=False)
+    print(f"[meta]    Saved metadata -> {meta_path}")
+
     print(f"[stats]   tokenizer_model = {tokenizer_name}")
     print(f"[stats]   avg input_toks  = {avg_in:.1f}")
     print(f"[stats]   avg output_toks = {avg_out:.1f}")
