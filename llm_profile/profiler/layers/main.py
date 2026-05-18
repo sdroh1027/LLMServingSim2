@@ -114,6 +114,13 @@ def _create_past_key_values(config, kv_len, device):
         from transformers.models.phimoe.modeling_phimoe import PhimoeRotaryEmbedding
         rope = PhimoeRotaryEmbedding(config)
         cos, sin = rope(dummy_x, kv_len)
+    elif "qwen3_5_moe" in config.model_type:
+        # NB: must precede the 'qwen3' branch — substring would otherwise catch us
+        from models.modeling_qwen3_5_moe import Qwen3_5MoeTextRotaryEmbedding
+        rope = Qwen3_5MoeTextRotaryEmbedding(config)
+        bsz = dummy_x.shape[0]
+        position_ids = torch.arange(kv_len, device=dummy_x.device).unsqueeze(0).expand(bsz, -1)
+        cos, sin = rope(dummy_x, position_ids)
     elif "qwen3" in config.model_type:
         from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
         rope = Qwen3RotaryEmbedding(config)
@@ -121,7 +128,7 @@ def _create_past_key_values(config, kv_len, device):
         position_ids = torch.arange(kv_len, device=dummy_x.device).unsqueeze(0).expand(bsz, -1)
         cos, sin = rope(dummy_x, position_ids)
     else:
-        raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE, Qwen3 models are supported in profiling. We will add more models soon.")
+        raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE, Qwen3, Qwen3.5-MoE models are supported in profiling. We will add more models soon.")
 
     cache = DynamicCache()
     for layer_idx in range(num_layers):
@@ -153,6 +160,9 @@ def run_profile(
 ):
 
     config = AutoConfig.from_pretrained(model_name)
+    # Multimodal Qwen3.5-MoE: drop into the text sub-config for LLM profiling
+    if 'qwen3_5_moe' in config.model_type and hasattr(config, 'text_config'):
+        config = config.text_config
     original_num_layers = config.num_hidden_layers
     config.num_hidden_layers = num_layers
     config.dtype = torch.float16
@@ -174,13 +184,17 @@ def run_profile(
         # If you want to collect router stats during profiling, turn this on
         config.collect_router_stats = False
         model = PhimoeForCausalLM(config)
+    elif 'qwen3_5_moe' in config.model_type:
+        # NB: must precede the 'qwen3' branch — substring would otherwise catch us
+        from models.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
+        model = Qwen3_5MoeForCausalLM(config)
     elif 'qwen3' in config.model_type:
         from models.qwen3 import Qwen3ForCausalLM
         # If you want to collect router stats during profiling, turn this on
         config.collect_router_stats = False
         model = Qwen3ForCausalLM(config)
     else:
-        raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE, Qwen3 models are supported in profiling. We will add more models soon.")
+        raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE, Qwen3, Qwen3.5-MoE models are supported in profiling. We will add more models soon.")
     
     model.eval()
     model.to(config.dtype)
@@ -246,6 +260,13 @@ def run_profile(
         profile_keys = ["embedding", "input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate_proj", "up_proj", "act_fn", "down_proj", "final_layernorm", "lm_head"]
         if 'mixtral' in config.model_type or 'phimoe' in config.model_type:
             profile_keys += ["gate", "expert.w1", "expert.w2", "expert.w3"]
+        elif 'qwen3_5_moe' in config.model_type:
+            # Linear-attention (GDN) path + MoE routing/experts + shared expert
+            profile_keys += [
+                "gdn_in_proj", "gdn_kernel", "gdn_post",
+                "router", "expert.mlp",
+                "shared_expert.mlp", "shared_expert_gate",
+            ]
 
         for key, value in time_stats.items():
             if key in profile_keys:
@@ -270,11 +291,16 @@ def run_profile(
             block_components = ["input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate_proj", "up_proj", "act_fn", "down_proj"]
         elif 'mixtral' in config.model_type or 'phimoe' in config.model_type:
             block_components = ["input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate"]
+        elif 'qwen3_5_moe' in config.model_type:
+            # Shared per-layer ops only (norms + MoE block). Token-mixer cost is added
+            # below with layer_type weighting since layers alternate linear/full attention.
+            block_components = ["input_layernorm", "post_layernorm",
+                                "router", "shared_expert.mlp", "shared_expert_gate"]
         elif 'qwen3' in config.model_type:
-            block_components = ["input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate_proj", "up_proj", "act_fn", "down_proj"]    
+            block_components = ["input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate_proj", "up_proj", "act_fn", "down_proj"]
         else:
-            raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE models are supported in profiling. We will add more models soon.")
-        
+            raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE, Qwen3, Qwen3.5-MoE models are supported in profiling. We will add more models soon.")
+
         per_block_time = sum(results.get((input_len, kv_len, comp), 0.0) for comp in block_components)
 
         # Runs experts sequentially in huggungface implementation
@@ -283,6 +309,31 @@ def run_profile(
             n_tok = max(input_len // config.num_local_experts // tp_size, 1)
             for moe_comp in moe_components:
                 per_block_time += results.get((n_tok, kv_len, moe_comp), 0.0) * (config.num_local_experts // tp_size)
+        elif 'qwen3_5_moe' in config.model_type:
+            # Token-mixer: weight by linear_attention vs full_attention fraction
+            layer_types = getattr(config, 'layer_types', None) or []
+            if layer_types:
+                n_lin = sum(1 for t in layer_types if t == "linear_attention")
+                frac_lin = n_lin / len(layer_types)
+            else:
+                frac_lin = 0.75  # config default: full_attention_interval=4 → 3/4 linear
+            frac_full = 1.0 - frac_lin
+            gdn_time = sum(
+                results.get((input_len, kv_len, c), 0.0)
+                for c in ["gdn_in_proj", "gdn_kernel", "gdn_post"]
+            )
+            full_attn_time = sum(
+                results.get((input_len, kv_len, c), 0.0)
+                for c in ["q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj"]
+            )
+            per_block_time += gdn_time * frac_lin + full_attn_time * frac_full
+
+            # Sparse experts: each token routes to top_k experts → avg per-expert load
+            # = input_len * top_k / num_experts. Sum over all experts.
+            num_experts = getattr(config, 'num_experts', 256)
+            top_k = getattr(config, 'num_experts_per_tok', 8)
+            n_tok = max(input_len * top_k // num_experts // tp_size, 1)
+            per_block_time += results.get((n_tok, kv_len, "expert.mlp"), 0.0) * num_experts
 
         full_latency_estimate = embedding + final_norm + lm_head + per_block_time * original_num_layers
 
@@ -311,6 +362,9 @@ def main():
 
     # Load model config once per script run
     model_config = AutoConfig.from_pretrained(args.model) # token="hf_xxx"
+    # Multimodal Qwen3.5-MoE: validate TP against the text sub-config
+    if 'qwen3_5_moe' in model_config.model_type and hasattr(model_config, 'text_config'):
+        model_config = model_config.text_config
 
     for tp_size in tp_sizes:
         if validate_tp_size(tp_size, model_config.num_attention_heads):
