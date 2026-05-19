@@ -63,6 +63,10 @@ def main():
 
     # Load model config once per script run
     model_config = AutoConfig.from_pretrained(args.model)
+    # Multimodal Qwen3.5-MoE: drop into the text sub-config so attention shape
+    # attributes (num_attention_heads, num_key_value_heads, head_dim, ...) resolve.
+    if 'qwen3_5_moe' in model_config.model_type and hasattr(model_config, 'text_config'):
+        model_config = model_config.text_config
     model_config.dtype = torch.float16
     
     for tp_size in tp_sizes:

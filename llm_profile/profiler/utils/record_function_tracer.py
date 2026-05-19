@@ -65,17 +65,29 @@ class RecordFunctionTracer:
 
         trace = json.load(open(self.trace_path, "r"))["traceEvents"]
 
+        # PyTorch trace splits launch events between "cuda_runtime" (legacy /
+        # cudart) and "cuda_driver" (newer CUPTI / cuLaunchKernel path). Older
+        # versions of this tracer only inspected cuda_runtime, which silently
+        # dropped any op whose launches all went through the driver category
+        # (e.g. a single large GEMM like lm_head). Look at both, and dedupe
+        # correlations so a launch isn't double-counted if both paths fire.
         for event in trace:
             if not ("cat" in event and event["cat"] == "user_annotation"):
                 continue
             children = self.find_children(trace, event)
             cuda_time = 0
+            seen_corr = set()
             for child in children:
-                if not ("cat" in child and child["cat"] == "cuda_runtime"):
+                cat = child.get("cat")
+                if cat not in ("cuda_runtime", "cuda_driver"):
+                    continue
+                corr = child.get("args", {}).get("correlation")
+                if corr is None or corr in seen_corr:
                     continue
                 correlated_event = self.find_correlated_event(trace, child)
                 if not correlated_event:
                     continue
+                seen_corr.add(corr)
                 cuda_time += correlated_event["dur"]
             if cuda_time == 0:
                 continue

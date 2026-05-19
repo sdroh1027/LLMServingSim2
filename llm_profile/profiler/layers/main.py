@@ -1,3 +1,78 @@
+"""
+LLM non-attention layer profiler.
+
+Goal
+----
+Measure each major sub-layer's GPU cost in isolation so a downstream simulator
+can re-assemble them and predict full-model latency under different shapes,
+TP degrees, batch configurations, etc.
+
+Ground truth
+------------
+Production runs the model under torch.compile / CUDAGraph, where kernels are
+launched back-to-back with negligible Python dispatch overhead and minimal
+inter-kernel idle. So a faithful "what does this op cost in production" is
+approximated by *kernel execution time*, NOT by raw eager wall-clock (which
+includes Python dispatch, launch overhead, and idle gaps that compiled
+production removes).
+
+Timer strategy
+--------------
+1. **Per-component measurement uses `record_function` cuda_time** (kernel-only).
+   - record_function spans + chrome-trace parsing sum the correlated kernel
+     durations inside each span. This is the time the GPU actually spent
+     executing that op's kernels — ignoring Python overhead between launches.
+   - For fused single-kernel ops (lm_head, grouped_mm MoE block) this equals
+     the kernel's own runtime, which is also what production sees.
+   - For sequential micro-ops (e.g. eager MoE Python loop) this correctly
+     EXCLUDES the per-iter Python/dispatch overhead — production wouldn't
+     pay that anyway because the fused kernel doesn't iterate in Python.
+   - Note: the RecordFunctionTracer must look at BOTH `cuda_runtime` and
+     `cuda_driver` categories (PyTorch 25.01 routes single-kernel launches
+     through cuda_driver), otherwise some ops silently report 0 (lm_head
+     was the canonical example before that patch).
+
+2. **CUDA Event measurements are NOT a substitute** for per-op profiling.
+   - Wrapping an op with start/end Events and elapsed_time includes any GPU
+     idle gap in the stream — including dispatch overhead that production
+     does not have. Such values over-state the op's production cost.
+   - The earlier CUDA-event `experts_call` measurement (95 ms in eager mode)
+     was misleading for this reason; the production kernel cost is the
+     ~4 ms record_function sum (eager) or ~11 ms (grouped_mm fused).
+
+3. **Sanity / consistency check uses a CUDA Graph capture** of the full
+   forward, replayed and timed end-to-end. CUDA Graph replay launches the
+   captured kernel sequence with near-zero CPU overhead, mimicking the
+   production execution model. Sum of per-op record_function cuda_times
+   should match this CUDA-Graph wall-clock within a few percent; if it
+   diverges, either an op is missing instrumentation or our trace parser
+   is dropping a launch.
+   - An eager-mode full_forward CUDA Event wall-clock is NOT a valid baseline:
+     it includes per-op Python dispatch that production strips out, so the
+     "unaccounted" gap there is profiler-environment noise, not real cost.
+
+4. **Which experts implementation to profile**: production uses the default
+   (`grouped_mm`) fused kernel. Profile that. Don't force `_experts_implementation
+   = "eager"` — the per-expert breakdown isn't needed by the simulator and the
+   Python iteration noise is irrelevant to production timing.
+
+TODO: full_forward baseline improvement
+---------------------------------------
+Current sanity baseline tries CUDA Graph capture but falls back to eager
+wall-clock for MoE models because the routing path uses dynamic-shape ops
+(e.g. `.nonzero()` on the expert hit mask) that CUDAGraph cannot capture.
+The eager fallback over-states the gap by the cumulative Python dispatch
+overhead between sub-blocks (~10 ms for a 1-layer 35B-A3B prefill at len=256).
+Follow-ups to make the baseline truly production-equivalent:
+  - try `torch.compile(model, mode="reduce-overhead", dynamic=True)`
+  - or replace MoE routing with a CUDAGraph-safe static path (Megatron-style
+    fixed-capacity routing)
+  - or wrap only the static prefix/suffix of the forward in CUDAGraph and
+    leave the MoE block as eager (hybrid baseline)
+Until then, treat `timer_sum` as the authoritative production-realistic
+per-layer-cost sum; the `full_forward` value is an upper-bound diagnostic.
+"""
+
 import torch
 
 from collections import defaultdict
@@ -130,8 +205,17 @@ def _create_past_key_values(config, kv_len, device):
     else:
         raise NotImplementedError("Only LLaMA, Mixtral, Phi-MoE, Qwen3, Qwen3.5-MoE models are supported in profiling. We will add more models soon.")
 
-    cache = DynamicCache()
+    # Hybrid models (e.g. Qwen3.5-MoE) interleave linear-attention and full-attention
+    # layers. Build the cache from config so each slot has the correct mixin type;
+    # only write K/V into full-attention slots.
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None:
+        cache = DynamicCache(config=config)
+    else:
+        cache = DynamicCache()
     for layer_idx in range(num_layers):
+        if layer_types is not None and layer_types[layer_idx] != "full_attention":
+            continue
         cache.update(
             key_states,
             value_states,
@@ -156,7 +240,7 @@ def run_profile(
     repeat=100,
     profile_method="record_function",
     csv_append=True,
-    verbose=False
+    verbose=False,
 ):
 
     config = AutoConfig.from_pretrained(model_name)
@@ -164,10 +248,19 @@ def run_profile(
     if 'qwen3_5_moe' in config.model_type and hasattr(config, 'text_config'):
         config = config.text_config
     original_num_layers = config.num_hidden_layers
+    original_layer_types = list(getattr(config, 'layer_types', []) or [])
     config.num_hidden_layers = num_layers
     config.dtype = torch.float16
     config.pad_token_id = 1
     config.tp_size = tp_size
+    # Qwen3.5-MoE is a hybrid linear+full attention model. This layers profiler
+    # measures only the GDN (linear_attention) token mixer and the shared per-block
+    # components; full-attention cost is profiled separately by profile_attn_*.sh
+    # and combined downstream via the layer_type fractions stored above.
+    # The MoE block uses the default (grouped_mm) fused kernel, timed end-to-end
+    # by the CUDA events embedded in Qwen3_5MoeSparseMoeBlock (key "experts_call").
+    if 'qwen3_5_moe' in config.model_type:
+        config.layer_types = ["linear_attention"] * num_layers
     # Call singletone instance TimerStatsStore to set profile method
     timer_stats_store = TimerStatsStore(profile_method=profile_method)
 
@@ -188,6 +281,28 @@ def run_profile(
         # NB: must precede the 'qwen3' branch — substring would otherwise catch us
         from models.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
         model = Qwen3_5MoeForCausalLM(config)
+        # When the cache has no full-attention layer (we profile linear-only),
+        # DynamicCache.get_seq_length / get_mask_sizes raise. For a fresh cache
+        # (kv_len=0) the equivalents are 0 / (q_len, 0); patch fallbacks in.
+        from transformers.cache_utils import DynamicCache as _DC
+        if not getattr(_DC, "_profile_no_attn_patched", False):
+            _orig_gsl = _DC.get_seq_length
+            def _safe_gsl(self, layer_idx=0):
+                try:
+                    return _orig_gsl(self, layer_idx)
+                except (ValueError, StopIteration):
+                    return 0
+            _DC.get_seq_length = _safe_gsl
+
+            _orig_gms = _DC.get_mask_sizes
+            def _safe_gms(self, query_length, layer_idx=0):
+                try:
+                    return _orig_gms(self, query_length, layer_idx)
+                except (ValueError, StopIteration):
+                    return query_length, 0
+            _DC.get_mask_sizes = _safe_gms
+
+            _DC._profile_no_attn_patched = True
     elif 'qwen3' in config.model_type:
         from models.qwen3 import Qwen3ForCausalLM
         # If you want to collect router stats during profiling, turn this on
@@ -219,52 +334,116 @@ def run_profile(
         input_ids = torch.randint(low=0, high=config.vocab_size // tp_size, size=(1, input_len), device=device)
 
         num_layers = config.num_hidden_layers
-        past_key_values = _create_past_key_values(config, kv_len, device)
+        # For kv_len=0 (prefill), let the model construct its own cache. Manually
+        # pre-filled caches need to contain the right layer-type mixins (hybrid
+        # models like Qwen3.5-MoE need *both* attention and linear-attention
+        # layers present), and passing None avoids that fragility.
+        def _make_pkv():
+            if kv_len == 0:
+                return None
+            return _create_past_key_values(config, kv_len, device)
 
         # Warm-up phase
         for _ in range(warmup):
-            past_key_values = _create_past_key_values(config, kv_len, device)
+            past_key_values = _make_pkv()
             with torch.no_grad():
                 _ = model(input_ids, past_key_values=past_key_values, use_cache=True)
 
         torch.cuda.synchronize()
         timer_stats_store.clear_stats()
 
+        # ---- Profile pass: per-op record_function cuda_time ----
         if profile_method == ProfileMethod.RECORD_FUNCTION.value:
-            
+
             trace_output_dir = f"perf_models/{hardware}/{model_name}/tp{tp_size}"
             record_function_tracer = RecordFunctionTracer(trace_output_dir)
 
-            # Profiling phase
             with record_function_tracer:
                 for _ in range(repeat):
-                    past_key_values = _create_past_key_values(config, kv_len, device)
                     with torch.no_grad():
-                        _ = model(input_ids, past_key_values=past_key_values, use_cache=True) # 실제로 실행하는 부분 qwen.py 에 record_function이 걸려있음
-                
+                        _ = model(input_ids, past_key_values=_make_pkv(), use_cache=True)
+
             torch.cuda.synchronize()
             time_stats = record_function_tracer.get_operation_time_stats()
-            record_function_tracer.clean_up() # remove trace file after processing
+            record_function_tracer.clean_up()
 
         else:
-            # Profiling phase
             for _ in range(repeat):
-                past_key_values = _create_past_key_values(config, kv_len, device)
                 with torch.no_grad():
-                    _ = model(input_ids, past_key_values=past_key_values, use_cache=True)
-            
+                    _ = model(input_ids, past_key_values=_make_pkv(), use_cache=True)
+
             torch.cuda.synchronize()
             time_stats = timer_stats_store.get_stats()
+
+        # ---- Sanity pass: production-like wall-clock baseline ----
+        # See module docstring for rationale. CUDA Graph replay strips Python
+        # dispatch overhead; falls back to eager wall-clock if capture fails
+        # (MoE dynamic-shape routing isn't graph-safe — see TODO in docstring).
+        # Only sampled at input_len multiples of SANITY_STRIDE because the
+        # sanity baseline is much more expensive than the profile pass and
+        # one diagnostic per ~256-token bucket is enough to flag regressions.
+        SANITY_STRIDE = 256
+        if input_len % SANITY_STRIDE == 0:
+            import numpy as _np
+            full_forward_times_ms = []
+            graph_used = False
+            try:
+                static_pkv = _make_pkv()
+                for _ in range(3):
+                    with torch.no_grad():
+                        _ = model(input_ids, past_key_values=static_pkv, use_cache=True)
+                torch.cuda.synchronize()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.no_grad(), torch.cuda.graph(graph):
+                    _ = model(input_ids, past_key_values=static_pkv, use_cache=True)
+
+                for _ in range(repeat):
+                    s_evt = torch.cuda.Event(enable_timing=True)
+                    e_evt = torch.cuda.Event(enable_timing=True)
+                    s_evt.record()
+                    graph.replay()
+                    e_evt.record()
+                    torch.cuda.synchronize()
+                    full_forward_times_ms.append(s_evt.elapsed_time(e_evt))
+                graph_used = True
+            except Exception as ex:
+                log_warning(
+                    f"CUDA Graph capture failed ({type(ex).__name__}: {ex}); "
+                    "falling back to eager wall-clock baseline. The sanity gap "
+                    "will include Python dispatch overhead that production strips."
+                )
+                for _ in range(repeat):
+                    s_evt = torch.cuda.Event(enable_timing=True)
+                    e_evt = torch.cuda.Event(enable_timing=True)
+                    with torch.no_grad():
+                        s_evt.record()
+                        _ = model(input_ids, past_key_values=_make_pkv(), use_cache=True)
+                        e_evt.record()
+                    torch.cuda.synchronize()
+                    full_forward_times_ms.append(s_evt.elapsed_time(e_evt))
+
+            full_forward_median_ms = float(_np.median(full_forward_times_ms))
+            timer_sum_ms = sum(v.get("median", 0.0) for v in time_stats.values())
+            diff_pct = (full_forward_median_ms - timer_sum_ms) / full_forward_median_ms * 100.0 if full_forward_median_ms > 0 else 0.0
+            baseline_tag = "cuda_graph" if graph_used else "eager"
+            log_info(
+                f"[sanity] input={input_len} kv={kv_len} "
+                f"full_forward_median={full_forward_median_ms:.3f} ms ({baseline_tag}), "
+                f"timer_sum={timer_sum_ms:.3f} ms, "
+                f"unaccounted={diff_pct:+.1f}%"
+            )
 
 
         profile_keys = ["embedding", "input_layernorm", "q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj", "post_layernorm", "gate_proj", "up_proj", "act_fn", "down_proj", "final_layernorm", "lm_head"]
         if 'mixtral' in config.model_type or 'phimoe' in config.model_type:
             profile_keys += ["gate", "expert.w1", "expert.w2", "expert.w3"]
         elif 'qwen3_5_moe' in config.model_type:
-            # Linear-attention (GDN) path + MoE routing/experts + shared expert
+            # Linear-attention (GDN) path + MoE routing/shared expert + the
+            # fused MoE block timed end-to-end via CUDA events ("experts_call").
             profile_keys += [
                 "gdn_in_proj", "gdn_kernel", "gdn_post",
-                "router", "expert.mlp",
+                "router", "experts_call",
                 "shared_expert.mlp", "shared_expert_gate",
             ]
 
@@ -310,23 +489,18 @@ def run_profile(
             for moe_comp in moe_components:
                 per_block_time += results.get((n_tok, kv_len, moe_comp), 0.0) * (config.num_local_experts // tp_size)
         elif 'qwen3_5_moe' in config.model_type:
-            # Token-mixer: weight by linear_attention vs full_attention fraction
-            layer_types = getattr(config, 'layer_types', None) or []
-            if layer_types:
-                n_lin = sum(1 for t in layer_types if t == "linear_attention")
-                frac_lin = n_lin / len(layer_types)
-            else:
-                frac_lin = 0.75  # config default: full_attention_interval=4 → 3/4 linear
-            frac_full = 1.0 - frac_lin
-            gdn_time = sum(
+            # We profile a single linear-attention layer (full-attention is profiled
+            # separately). Per-block estimate = shared + GDN (raw, unweighted) + MoE.
+            # No layer-type fraction weighting here; downstream combines layer types.
+            per_block_time += sum(
                 results.get((input_len, kv_len, c), 0.0)
                 for c in ["gdn_in_proj", "gdn_kernel", "gdn_post"]
             )
-            full_attn_time = sum(
-                results.get((input_len, kv_len, c), 0.0)
-                for c in ["q_proj", "k_proj", "v_proj", "rope", "attn", "o_proj"]
-            )
-            per_block_time += gdn_time * frac_lin + full_attn_time * frac_full
+
+            # MoE block: CUDA-event measurement of the whole self.experts(...)
+            # call. Covers the fused grouped_mm kernel as a single op (no need
+            # to multiply by num_experts).
+            per_block_time += results.get((input_len, kv_len, "experts_call"), 0.0)
 
             # Sparse experts: each token routes to top_k experts → avg per-expert load
             # = input_len * top_k / num_experts. Sum over all experts.

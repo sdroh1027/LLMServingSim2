@@ -69,7 +69,9 @@ try:
     )
 except ImportError:
     from contextlib import nullcontext
-    def accepts_precomputed_kwargs(*a, **kw): return False
+    def accepts_precomputed_kwargs(*a, **kw):
+        def _decorator(fn): return fn
+        return _decorator
     def is_flash_attention_requested(cfg): return False
     def maybe_autocast(*a, **kw): return nullcontext()
     def merge_with_config_defaults(fn): return fn
@@ -808,8 +810,9 @@ class Qwen3_5MoeExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
 
-        # Bundled per-expert MLP timer: fires once per "hit" expert iteration,
-        # so recorded value approximates a single per-expert MLP cost.
+        # Per-expert Timer is dead in the default `grouped_mm` experts impl
+        # (the fused kernel bypasses this Python loop). Kept only as a fallback
+        # signal when someone explicitly selects the eager implementation.
         self._expert_mlp_timer = Timer(name="expert.mlp")
 
     def forward(
@@ -871,13 +874,21 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
         self._shared_expert_gate_timer = Timer(name="shared_expert_gate")
+        # MoE block wall-clock approximator (kernel-only): production uses the
+        # fused `grouped_mm` kernel which runs as a single back-to-back launch,
+        # so record_function's summed kernel time matches production cost. For
+        # rationale on why we deliberately exclude Python-loop overhead here,
+        # see the module-level docstring in profiler/layers/main.py.
+        self._experts_call_timer = Timer(name="experts_call")
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         shared_expert_output = self.shared_expert(hidden_states_reshaped)
         _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
-        expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+
+        with self._experts_call_timer:
+            expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
         with self._shared_expert_gate_timer:
             shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
