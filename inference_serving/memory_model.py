@@ -81,6 +81,25 @@ class MemoryModel():
             self.mem_for_kv // MB_TO_BYTE,
         )
 
+        # Sanity check: KV capacity must hold at least one max-sized batch
+        # worth of KV. If not, even a single full-size prefill cannot run;
+        # the scheduler would either reject every admission attempt or oscillate
+        # (admit → realize no KV → unlock → retry forever).
+        min_kv_needed = self.get_kv(max_num_batched_tokens)
+        if self.mem_for_kv < min_kv_needed:
+            raise RuntimeError(
+                f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: "
+                f"KV capacity {self.mem_for_kv // MB_TO_BYTE}MB is smaller than "
+                f"one max-batch worth of KV "
+                f"({min_kv_needed // MB_TO_BYTE}MB for {max_num_batched_tokens} tokens). "
+                f"Even a single max-sized prefill cannot fit. Choose one: "
+                f"reduce --max-num-batched-tokens to <= "
+                f"{int(self.mem_for_kv // max(self.get_kv(1), 1))}; "
+                f"increase npu_mem in the cluster config; "
+                f"raise TP (npu_num) to shard the weight; "
+                f"or pick a smaller model."
+            )
+
         if enable_prefix_caching:
             one_token_kv_size = self.get_kv(1)
             self.npu_prefix_cache = RadixCache(device='NPU', 

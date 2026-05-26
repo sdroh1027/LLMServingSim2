@@ -1,6 +1,7 @@
 # class that manages request of astra-sim
 class Request:
-    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, is_init=True):
+    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, is_init=True,
+                 session_id=None, turn_idx=0, intra_session_gap_ns=0):
         self.id = id
         self.model = model
         self.input = input
@@ -17,6 +18,15 @@ class Request:
         self.tpot = -1
         self.itl = []
         self.recent_end = 0
+
+        # Multi-turn session dependency (None => independent request, legacy path).
+        # `arrival` is mutated by Scheduler.add_done when the predecessor turn
+        # completes — it becomes the *effective* admission floor at runtime.
+        # `original_arrival` preserves the JSONL value for debugging / metrics.
+        self.session_id = session_id
+        self.turn_idx = turn_idx
+        self.intra_session_gap_ns = intra_session_gap_ns
+        self.original_arrival = arrival
 
         # For prefix caching modeling
         self.input_hash_ids = input_hash_ids

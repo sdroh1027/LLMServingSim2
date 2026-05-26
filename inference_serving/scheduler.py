@@ -1,5 +1,6 @@
 import pandas as pd
 from time import time
+import bisect
 import csv
 
 from .request import *
@@ -42,6 +43,13 @@ class Scheduler:
         self.batch_ids = -1
         self.first_arrival_time = 0
 
+        # Router-injected cross-scheduler index of all queued multi-turn req
+        # objects, used by add_done to find a completing req's successor turn
+        # (possibly on another scheduler) and advance its `arrival` directly.
+        # Structure: {session_id: {turn_idx: (req, owning_scheduler)}}.
+        # When None / missing, multi-turn dependency simply doesn't apply.
+        self.router_session_turns = {}
+
         # memory model
         self.memory = MemoryModel(model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, max_num_batched_tokens=self.max_num_batched_tokens)
 
@@ -61,6 +69,9 @@ class Scheduler:
         # first NPU to process new batch
         if sys == self.start_npu:
             # nothing to batch return None
+            # (self.request is arrival-sorted and arrival is mutated to the
+            # effective admission time when the predecessor turn completes,
+            # so this single check also enforces the multi-turn dependency)
             if len(self.request) != 0 and self.request[0].arrival > current:
                 return None
             # constraint of inflight batches considering parallelism
@@ -609,6 +620,32 @@ class Scheduler:
                     self.memory.free(kv_size, Device.NPU)
                 req.add_latency(finish)
                 self.done.append(req)
+                # Multi-turn dependency hook: advance the next turn's `arrival`
+                # in-place to max(its current arrival, finish + intra_gap),
+                # then re-sort its owning scheduler's request queue. The
+                # successor's `arrival` is now the single source of truth for
+                # admission — the short-circuit and admission filter above
+                # treat it correctly without any separate dependency state.
+                if req.session_id is not None:
+                    sess = self.router_session_turns.get(req.session_id)
+                    if sess is not None:
+                        child_entry = sess.get(req.turn_idx + 1)
+                        if child_entry is not None:
+                            child, child_sched = child_entry
+                            # Use child.original_arrival (the JSONL value), not
+                            # child.arrival (which was parked at a sentinel by
+                            # Router.generate so it never admits early).
+                            new_arrival = max(child.original_arrival, req.end_time + child.intra_session_gap_ns)
+                            if new_arrival != child.arrival:
+                                try:
+                                    child_sched.request.remove(child)
+                                except ValueError:
+                                    # Already admitted/removed (shouldn't happen
+                                    # under correct dependency invariants).
+                                    pass
+                                else:
+                                    child.arrival = new_arrival
+                                    bisect.insort(child_sched.request, child, key=lambda r: r.arrival)
                 end_reqs.append(req)
 
             # return to pool
@@ -632,8 +669,11 @@ class Scheduler:
         return self.batch_ids
 
     # add a request
-    def add_request(self, req, is_init=True):
-        new_req = Request(*(req), is_init=is_init)
+    def add_request(self, req, is_init=True,
+                    session_id=None, turn_idx=0, intra_session_gap_ns=0):
+        new_req = Request(*(req), is_init=is_init,
+                          session_id=session_id, turn_idx=turn_idx,
+                          intra_session_gap_ns=intra_session_gap_ns)
         if new_req.is_init and new_req.input > self.max_num_batched_tokens:
             self.logger.error(
                 "Request #%d has input_length=%d which exceeds max_num_batched_tokens=%d. "
@@ -644,12 +684,17 @@ class Scheduler:
                 f"Request #{new_req.id} input_length={new_req.input} exceeds "
                 f"max_num_batched_tokens={self.max_num_batched_tokens}"
             )
-        self.request.append(new_req)
-        return
+        # Keep self.request sorted by arrival_time so the schedule short-circuit
+        # `self.request[0].arrival > current → return None` and get_next_arrival_time
+        # remain correct, regardless of insertion order (bulk pre-load OR
+        # real-time multi-turn injection).
+        bisect.insort(self.request, new_req, key=lambda r: r.arrival)
+        return new_req
     
     # add decode request to decode instance from prefill instnace
     def add_decode(self, req):
-        self.request.append(req)
+        # Sorted insertion to keep self.request arrival-ordered (PD-split path).
+        bisect.insort(self.request, req, key=lambda r: r.arrival)
         kv_size = self.memory.get_total_kv(req)
         self.memory.allocate(kv_size, Device.NPU)
     

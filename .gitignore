@@ -21,3 +21,6 @@ dataset/qwen_traceA_*.meta.json
 output_*.csv
 
 *.txt
+# swe_multiturn: main trace lives on HF (271 MB > GitHub limit); fetch via README
+dataset/swe_multiturn/swebench_sonnet_*.jsonl
+!dataset/swe_multiturn/swebench_sonnet_*.debug.jsonl

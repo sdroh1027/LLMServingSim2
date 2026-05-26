@@ -70,11 +70,23 @@ class BypassController():
         # Min-heap of (finish_cycle_ns, npu_id, iteration_id)
         self.events = []
 
-    def submit_event(self, finish_cycle_ns, npu_id):
-        """Add a batch/event completion to the event queue."""
-        it = self.iteration[npu_id]
-        self.iteration[npu_id] += 1
-        heapq.heappush(self.events, (finish_cycle_ns, npu_id, it))
+    def submit_event(self, finish_cycle_ns, npu_id, is_timer=False):
+        """Add a batch/event completion to the event queue.
+
+        is_timer=True is used for wakeup/wait events that do NOT correspond to
+        a real batch completion (initial startup tick, next-arrival wakeup).
+        These must NOT advance the iteration counter, because Scheduler.add_done
+        looks up batches by `iteration - 1 == batch_id`; an extra iteration
+        bump from a filler timer event would permanently desync the mapping
+        and leave the batch stuck inflight.
+        """
+        if is_timer:
+            # Sentinel iteration id < 0 → add_done's batch lookup yields no match (no-op).
+            heapq.heappush(self.events, (finish_cycle_ns, npu_id, -1))
+        else:
+            it = self.iteration[npu_id]
+            self.iteration[npu_id] += 1
+            heapq.heappush(self.events, (finish_cycle_ns, npu_id, it))
 
     def has_event_for_npu(self, npu_id):
         """Check if any pending event exists for the given NPU."""
@@ -98,7 +110,8 @@ class BypassController():
         return ["", "", "Checking Non-Exited Systems ...\n", "All Request Has Been Exited\n"]
 
     def parse_output(self, output):
-        pattern = r"sys\[(\d+)\] iteration (\d+) finished, (\d+) cycles, exposed communication (\d+) cycles."
+        # iteration may be a sentinel -1 for timer-only events (see submit_event)
+        pattern = r"sys\[(\d+)\] iteration (-?\d+) finished, (\d+) cycles, exposed communication (\d+) cycles."
         match = re.search(pattern, output)
         if match:
             return {

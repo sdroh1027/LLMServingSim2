@@ -1,0 +1,27 @@
+{
+  "tokenizer_model": "Qwen/Qwen3.5-122B-A10B",
+  "vocab_size": 248044,
+  "input_parquet": "data/swebench_sonnet.parquet",
+  "num_sessions": 110,
+  "num_requests": 2559,
+  "session_start_rate_per_sec": 2.0,
+  "seed": 42,
+  "input_toks": {
+    "min": 3039,
+    "max": 65960,
+    "mean": 20247.892536146934
+  },
+  "output_toks": {
+    "min": 65,
+    "max": 11445,
+    "mean": 288.73700664322
+  },
+  "claude_vs_qwen_output_length": {
+    "total_claude": 738878,
+    "total_qwen": 715691,
+    "ratio_qwen_over_claude": 0.968618635282144
+  },
+  "prefix_share_ratio_mean": 0.9388135888856332,
+  "msg_token_cache_hits": 140,
+  "msg_token_cache_misses": 5743
+}

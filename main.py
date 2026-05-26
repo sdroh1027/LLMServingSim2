@@ -315,7 +315,9 @@ def main():
     if bypass_astrasim:
         # Bypass mode: use BypassController instead of AstraSim
         controller = BypassController(total_npu)
-        # Submit initial timer event (equivalent to generate_event + AstraSim startup)
+        # Submit initial startup event. This consumes iteration slot 0 so that
+        # the first real batch (batch_id=0) maps to iteration 1, matching
+        # Scheduler.add_done's `iteration - 1 == batch_id` convention.
         for npu_id in range(total_npu):
             controller.submit_event(int(event_time), npu_id)
     else:
@@ -412,7 +414,17 @@ def main():
                                 _acc[4] += 1
                                 _acc[5] += new_req.num_decode
                     finish_time = current + batch_cycles_ns
-                    controller.submit_event(finish_time, sys)
+                    # In real astra-sim each NPU in the TP group emits its own
+                    # completion event when its slice of the batch finishes.
+                    # Scheduler.add_done waits for BOTH start_npu and
+                    # (start_npu + npu_num - 1) to appear in batch.end before
+                    # marking the batch done — submitting only `sys` (the start
+                    # NPU) leaves any TP>1 batch stuck inflight forever.
+                    # Emulate lockstep TP completion by emitting one event per
+                    # NPU of this instance at the same finish_time.
+                    inst_start = inst2npu_mapping[instance_id]
+                    for offset in range(instance["npu_num"]):
+                        controller.submit_event(finish_time, inst_start + offset)
                 else:
                     generate_trace(new_req, instance["hardware"], instance["npu_num"], instance["npu_group"], instance["pd_type"],
                                    node_id, instance_id, max_num_batched_tokens, placement[instance_id], block_mode_on[instance_id],
@@ -585,12 +597,20 @@ def main():
                 controller.write_flush(p, "done") # make done instances to sleep
         elif new_req == None:
             if bypass_astrasim:
-                # No batch scheduled — add a timer event to advance time
-                # to the next request arrival or log interval
-                if not controller.has_event_for_npu(sys):
+                # No batch scheduled — submit a wakeup timer for the next
+                # arrival. `req.arrival` already encodes the multi-turn
+                # dependency floor (mutated by add_done when predecessor
+                # completes), so plain get_next_arrival_time is sufficient.
+                # Only the start_npu drives admission decisions — other NPUs
+                # in the TP group are woken by batch-completion events the
+                # start_npu emits; skipping wakeup timers for them avoids
+                # unnecessary O(n) scans of self.request.
+                if sys != inst2npu_mapping[instance_id]:
+                    pass
+                elif not controller.has_event_for_npu(sys):
                     next_arrival = schedulers[instance_id].get_next_arrival_time(current)
                     if next_arrival is not None:
-                        controller.submit_event(next_arrival, sys)
+                        controller.submit_event(next_arrival, sys, is_timer=True)
                     # If no arrival and no events, loop will terminate via done check
             else:
                 controller.write_flush(p, "pass")
