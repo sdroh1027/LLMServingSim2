@@ -1,7 +1,9 @@
 import os
+import re
 import subprocess
 import argparse
 import json
+from datetime import datetime
 from time import time
 from collections import defaultdict
 
@@ -20,6 +22,29 @@ from inference_serving.logger import *
 import sys as flush
 
 from pyinstrument import Profiler
+
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+
+class _Tee:
+    def __init__(self, *streams, strip_ansi_on=()):
+        self._streams = streams
+        self._strip = {id(s) for s in strip_ansi_on}
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(_ANSI_RE.sub('', data) if id(s) in self._strip else data)
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return bool(self._streams) and self._streams[0].isatty()
 
 
 def main():
@@ -60,6 +85,16 @@ def main():
     parser.add_argument('--bypass-use-file', action='store_true', help='use file-based bypass path instead of in-memory (slower, for debugging)', default=False)
 
     args = parser.parse_args()
+
+    if args.output:
+        log_path = os.path.splitext(args.output)[0] + '.log'
+    else:
+        log_dir = os.path.join(cwd, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    log_fh = open(log_path, "w", encoding="utf-8", buffering=1)
+    flush.stdout = _Tee(flush.stdout, log_fh, strip_ansi_on=(log_fh,))
+    print(f"Logging stdout to: {log_path}")
 
     print_logo()
     print_input_config(args=args)
@@ -660,9 +695,27 @@ def main():
     print(f"Total input tokens:                                                 {total_prompt}")
     print(f"Total generated tokens:                                             {total_gen}")
     print(f"Request throughput (req/s):                                         {req_cnt/total_latency:.2f}")
-    print(f"Average prompt throughput (tok/s):                                  {total_prompt/total_latency:.2f}")
-    print(f"Average generation throughput (tok/s):                              {total_gen/total_latency:.2f}")
-    print(f"Total token throughput (tok/s):                                     {(total_prompt + total_gen)/total_latency:.2f}")
+    # NOTE: "End-to-end input rate" = total_input / total_latency. This includes
+    # decode + queueing time — it is NOT the prefill compute rate. For the raw
+    # prefill engine speed see "Prefill compute throughput" below.
+    print(f"End-to-end input rate (tok/s):                                      {total_prompt/total_latency:.2f}  [= total input / total_latency]")
+    print(f"End-to-end output rate (tok/s):                                     {total_gen/total_latency:.2f}  [= total output / total_latency]")
+    print(f"Total token rate (tok/s):                                           {(total_prompt + total_gen)/total_latency:.2f}")
+
+    # Bypass mode tracks per-phase wall time directly via _cu_pf / _cu_dc.
+    # Use it to compute prefill-only and effective-prefill throughputs, which
+    # are the metrics that actually scale with cache-hit savings.
+    if bypass_astrasim and not bypass_use_file:
+        _prefill_time_s = _cu_pf[3] / 1e9
+        _decode_time_s = _cu_dc[3] / 1e9
+        print(f"Prefill / Decode time (s):                                          {_prefill_time_s:.3f} / {_decode_time_s:.3f}")
+        if _prefill_time_s > 0:
+            print(f"Prefill compute throughput (tok/s):                                 {total_prompt/_prefill_time_s:.2f}  [= total input / prefill_time]")
+            if enable_prefix_caching:
+                _total_hit_for_calc = total_npu_hit_tokens + total_cpu_hit_tokens
+                _non_cached = total_prompt - _total_hit_for_calc
+                if _non_cached > 0:
+                    print(f"Effective prefill throughput (tok/s):                               {_non_cached/_prefill_time_s:.2f}  [= (input - cache hits) / prefill_time]")
     print(f"Throughput per {1/RATIO} sec: {throughput}")
     print(SINGLE_BAR)
     if enable_prefix_caching:

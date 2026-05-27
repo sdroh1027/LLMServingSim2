@@ -39,9 +39,9 @@
     ],
     "cxl_mem":
         {
-            "mem_size": 2560,
+            "mem_size": 256,
             "mem_latency": 500,
             "mem_bw": 52,
-            "num_devices": 10
+            "num_devices": 2
         }
 }

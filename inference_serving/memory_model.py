@@ -685,12 +685,17 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, tp=1, fp=
     # ----------------- Q/K/V Projections -----------------
     elif layer_name == "q_proj":
         # ColumnParallelLinear on output dim:
-        #   input  : [L, n_embd]          (replicated)
-        #   weight : [n_embd, n_embd // tp]
-        #   output : [L, n_embd // tp]    (sharded)
+        #   input  : [L, n_embd]                          (replicated)
+        #   weight : [n_embd, (n_head * head_dim) // tp]
+        #   output : [L, (n_head * head_dim) // tp]       (sharded)
+        # Note: q output dim is n_head * head_dim, which equals n_embd in
+        # classic models (Llama/GPT) but NOT in models like Qwen3-32B where
+        # head_dim is explicit and n_head * head_dim > n_embd. Using n_embd
+        # here would undercount the weight.
+        q_out_dim = n_head * head_dim
         input_size = length * n_embd * fp
-        weight_size = n_embd * (n_embd // tp) * fp
-        # output_size = length * (n_embd // tp) * fp
+        weight_size = n_embd * (q_out_dim // tp) * fp
+        # output_size = length * (q_out_dim // tp) * fp
         output_size = length * n_embd * fp # keep same size with k_proj input
 
     elif layer_name == "k_proj":
@@ -743,11 +748,14 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, tp=1, fp=
     # ----------------- Output Projection -----------------
     elif layer_name == "o_proj":
         # RowParallelLinear:
-        #   per rank input : [L, n_embd // tp]
-        #   per rank weight: [n_embd // tp, n_embd]
+        #   per rank input : [L, (n_head * head_dim) // tp]
+        #   per rank weight: [(n_head * head_dim) // tp, n_embd]
         #   per rank output: [L, n_embd] (after all-reduce)
-        input_size = length * (n_embd // tp) * fp
-        weight_size = (n_embd // tp) * n_embd * fp
+        # Same n_head*head_dim vs n_embd note as q_proj — must use the real
+        # attention output dim to match models like Qwen3-32B.
+        q_out_dim = n_head * head_dim
+        input_size = length * (q_out_dim // tp) * fp
+        weight_size = (q_out_dim // tp) * n_embd * fp
         output_size = length * n_embd * fp
 
 # ----------------- Dense FFN (non-MoE) -----------------

@@ -150,7 +150,7 @@ python -X utf8 -u main.py \
   --dataset dataset/swe_multiturn/swebench_sonnet_qwen3.5-122b_rate2.jsonl \
   --output output/swebench_sonnet_run.csv \
   --num-req 2559 \
-  --max-num-batched-tokens 70000 \
+  --max-num-batched-tokens 100000 \
   --bypass-astrasim
 ```
 
