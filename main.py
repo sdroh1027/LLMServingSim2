@@ -79,7 +79,7 @@ def main():
     parser.add_argument('--gen', action='store_false', default=True, help='skip initiation phase')
     parser.add_argument('--num-req', type=int, help='number of requests to use', default=100)
     parser.add_argument('--log-interval', type=float, help='interval to log throughput (sec)', default=0.5)
-    parser.add_argument('--log-level', type=str, choices=['WARNING', 'INFO', 'DEBUG'], help='log level to use', default='WARNING')
+    parser.add_argument('--log-level', type=str, choices=['ERROR', 'WARNING', 'INFO', 'DEBUG'], help='log level to use', default='WARNING')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], help='network backend to use', default='analytical')
     parser.add_argument('--bypass-astrasim', action='store_true', help='bypass AstraSim and compute cycles directly from trace (faster, single-node only)', default=False)
     parser.add_argument('--bypass-use-file', action='store_true', help='use file-based bypass path instead of in-memory (slower, for debugging)', default=False)
@@ -88,6 +88,8 @@ def main():
 
     if args.output:
         log_path = os.path.splitext(args.output)[0] + '.log'
+        if not os.path.isabs(log_path):
+            log_path = f'../{log_path}'
     else:
         log_dir = os.path.join(cwd, "logs")
         os.makedirs(log_dir, exist_ok=True)
@@ -396,6 +398,9 @@ def main():
             last_end_time[instance_id] = current
             waiting_request[instance_id] = True
 
+        # Snapshot inflight count to detect TP>1 batch completion below.
+        _inflight_before = len(schedulers[instance_id].inflight) if bypass_astrasim else 0
+
         # check request is done
         prompt_t, gen_t, reqs = schedulers[instance_id].add_done(id, sys, current)
         # add tokens in throughput
@@ -606,7 +611,21 @@ def main():
             if sys not in done_inst_npus[instance_id]:
                 done_inst_npus[instance_id].append(sys)
 
-            if len(done_inst_npus[instance_id]) == (1 if instances[instance_id]["npu_num"] == 1 else 2): # start & end npu
+            # Bypass mode emits no further per-NPU events once the queue drains,
+            # so the start_npu would never reach this check on its own (only the
+            # follower that closed the final batch gets here). A completed batch
+            # already implies every TP NPU finished, so register start_npu now
+            # to hit the done threshold instead of spinning on an empty heap.
+            if bypass_astrasim:
+                start_npu = inst2npu_mapping[instance_id]
+                if start_npu not in done_inst_npus[instance_id]:
+                    done_inst_npus[instance_id].append(start_npu)
+
+            # len(done_inst_npus) can be 0, 1, or 2 depending on TP and which NPUs have emitted done:
+            # 0: instance not done
+            # 1: start npu done (if npu_num(TP)==1, instance done)
+            # 2: start & end npu both done (instance done WHEN TP>=2)
+            if len(done_inst_npus[instance_id]) == (1 if instances[instance_id]["npu_num"] == 1 else 2):
                 done_instance.append(instance_id)
 
             # check if all prefill instances are done
@@ -626,7 +645,7 @@ def main():
                 print(bold(cyan("▶ Exiting simulation...\n")))
                 if not bypass_astrasim:
                     controller.write_flush(p, "exit")
-                break
+                break # exit while loop and end simulation, if all instances are done
 
             if not bypass_astrasim:
                 controller.write_flush(p, "done") # make done instances to sleep
@@ -640,10 +659,20 @@ def main():
                 # in the TP group are woken by batch-completion events the
                 # start_npu emits; skipping wakeup timers for them avoids
                 # unnecessary O(n) scans of self.request.
-                if sys != inst2npu_mapping[instance_id]:
-                    pass
-                elif not controller.has_event_for_npu(sys):
-                    next_arrival = schedulers[instance_id].get_next_arrival_time(current)
+                if sys != inst2npu_mapping[instance_id]:  # if this npu(sys) is follower
+                    # TP>1: if this event just closed the batch, wake start_npu
+                    # so it can admit the next one (next-arrival timer can't,
+                    # once arrivals are exhausted).
+                    if len(schedulers[instance_id].inflight) < _inflight_before:
+                        start_npu = inst2npu_mapping[instance_id]
+                        if not controller.has_event_for_npu(start_npu):
+                            controller.submit_event(current, start_npu, is_timer=True)
+                # if sys is master: park on next arrival only if inflight has a free slot.
+                # If full, stay silent — the follower's wakeup above re-triggers
+                # us, so a timer here would stall ready decode work.
+                elif len(schedulers[instance_id].inflight) < schedulers[instance_id].npu_group \
+                        and not controller.has_event_for_npu(sys):
+                    next_arrival = schedulers[instance_id].get_next_arrival_time(current) # get time of nearest future request
                     if next_arrival is not None:
                         controller.submit_event(next_arrival, sys, is_timer=True)
                     # If no arrival and no events, loop will terminate via done check
