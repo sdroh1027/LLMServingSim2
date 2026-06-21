@@ -315,11 +315,24 @@ def main():
     for r in records:
         by_sid[r["session_id"]].append(r)
     turns_per_session = [len(v) for v in by_sid.values()]
-    prefix_share = []
+    # Two per-turn-transition (N>=1) reuse measures, both turn-sampled:
+    #   input_only : input_toks[N-1] / input_toks[N]
+    #                -> fraction of turn N's prompt that overlaps the PREVIOUS PROMPT only.
+    #                   Conservative lower bound (matches swe_multiturn meta.json def).
+    #   incl_output: (input_toks[N-1] + output_toks[N-1]) / input_toks[N]
+    #                -> fraction already in KV cache after turn N-1 (prev prompt + decoded
+    #                   output). This is the real reusable-prefix fraction the radix tree sees,
+    #                   since output_tok_ids[N-1] is carried verbatim into input_tok_ids[N].
+    prefix_share_input_only = []
+    prefix_share_incl_output = []
     for sid, lst in by_sid.items():
         lst.sort(key=lambda r: r["turn_idx"])
         for i in range(1, len(lst)):
-            prefix_share.append(lst[i - 1]["input_toks"] / max(lst[i]["input_toks"], 1))
+            cur_in = max(lst[i]["input_toks"], 1)
+            prev_in = lst[i - 1]["input_toks"]
+            prev_out = lst[i - 1]["output_toks"]
+            prefix_share_input_only.append(prev_in / cur_in)
+            prefix_share_incl_output.append((prev_in + prev_out) / cur_in)
 
     def pct(xs, p):
         return float(np.percentile(np.asarray(xs), p)) if xs else 0.0
@@ -370,7 +383,13 @@ def main():
             "p95": pct(output_lens, 95),
             "max": int(max(output_lens)) if output_lens else 0,
         },
-        "prefix_share_ratio_mean": float(np.mean(prefix_share)) if prefix_share else 0.0,
+        # Reuse ratios (turn-sampled over all N>=1 transitions). See computation comment above.
+        "prefix_share_ratio_mean": float(np.mean(prefix_share_input_only)) if prefix_share_input_only else 0.0,
+        "kv_reuse_ratio_input_only_mean": float(np.mean(prefix_share_input_only)) if prefix_share_input_only else 0.0,
+        "kv_reuse_ratio_incl_output_mean": float(np.mean(prefix_share_incl_output)) if prefix_share_incl_output else 0.0,
+        "kv_reuse_ratio_note": "input_only = input[N-1]/input[N] (lower bound, prev prompt only); "
+                               "incl_output = (input[N-1]+output[N-1])/input[N] (real reusable prefix, "
+                               "since prev output is carried verbatim into next input).",
     }
     meta_path = out_path.with_suffix(".meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -397,7 +416,8 @@ def main():
           f"p95={meta['input_toks']['p95']:.0f} max={meta['input_toks']['max']}")
     print(f"[stats] output_toks    mean={meta['output_toks']['mean']:.1f} "
           f"p95={meta['output_toks']['p95']:.0f} max={meta['output_toks']['max']}")
-    print(f"[stats] prefix_share   {meta['prefix_share_ratio_mean']:.3f}")
+    print(f"[stats] kv_reuse       input_only={meta['kv_reuse_ratio_input_only_mean']:.3f} "
+          f"incl_output={meta['kv_reuse_ratio_incl_output_mean']:.3f}")
     print(f"[stats] dropped empty/no-pair/short = "
           f"{n_dropped_empty}/{n_dropped_no_pair}/{n_dropped_short}; "
           f"truncated len/turns = {n_truncated_by_len}/{n_truncated_by_turns}")

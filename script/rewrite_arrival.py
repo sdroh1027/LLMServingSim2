@@ -4,6 +4,11 @@
 input_toks/output_toks/input_tok_ids/output_tok_ids는 그대로 유지하고,
 arrival_time_ns만 포아송 프로세스로 다시 생성한다.
 
+[순서 보장] 라인순 = 시간순.
+  - 입력 jsonl의 N번째 줄에는 N번째로 작은 arrival_time_ns가 할당된다.
+  - 즉, 출력 jsonl도 위에서 아래로 읽으면 시간순으로 정렬되어 있다.
+  - 포아송 누적합(cumulative sum of expovariate intervals)이라 단조 증가가 보장됨.
+
 함께 존재하는 .meta.json 파일이 있으면 arrival_rate_req_per_sec/seed를 갱신한다.
 
 사용법:
@@ -21,7 +26,11 @@ from pathlib import Path
 
 
 def generate_arrival_times(n: int, rate: float, seed: int = 42) -> list:
-    """포아송 프로세스로 arrival_time_ns 생성 (rate: req/sec)."""
+    """포아송 프로세스로 arrival_time_ns 생성 (rate: req/sec).
+
+    누적합 방식이라 반환 리스트는 단조 증가(monotonically increasing).
+    times[0] < times[1] < ... < times[n-1] 보장.
+    """
     rng = random.Random(seed)
     times = []
     t = 0
